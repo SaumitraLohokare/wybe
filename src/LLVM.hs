@@ -343,8 +343,9 @@ recordExtern :: ModSpec -> Prim -> LLVM ()
 recordExtern mod (PrimCall _ pspec _ args _) = recordExternProc mod pspec args
 recordExtern _ PrimHigher{} = return ()
 recordExtern _ (PrimForeign "llvm" _ _ _) = return ()
-recordExtern _ (PrimForeign "lpvm" "alloc" _ _) =
-    recordExternSpec externAlloc
+recordExtern _ (PrimForeign "lpvm" "alloc" flags _)
+    | "stack" `elem` flags = return ()  -- stack-allocated; no extern needed
+    | otherwise            = recordExternSpec externAlloc
 recordExtern mod (PrimForeign "lpvm" "load" _ [ArgGlobal glob ty,_]) =
     recordExternVar mod glob ty
 recordExtern mod (PrimForeign "lpvm" "store" _ [_,ArgGlobal glob ty]) =
@@ -941,11 +942,17 @@ writeLLVMCall op flags args pos = do
 
 -- | Generate LPVM (memory management) instruction
 writeLPVMCall :: ProcName -> [Ident] -> [PrimArg] -> OptPos -> LLVM ()
-writeLPVMCall "alloc" _ args pos = do
+writeLPVMCall "alloc" flags args pos = do
     releaseDeferredCall
     args' <- partitionArgs "lpvm alloc instruction" args
     case args' of
-        ([sz],[out]) -> heapAlloc out sz pos
+        ([sz],[out]) ->
+            if "stack" `elem` flags
+            then case argIntVal sz of
+                -- We checked it was constant during Transform, so this should match
+                Just sizeVal -> stackAlloc out (fromIntegral sizeVal)
+                Nothing      -> shouldnt "stack alloc with non-constant size"
+            else heapAlloc out sz pos
         _            -> shouldnt $ "lpvm alloc with arguments " ++ show args
 writeLPVMCall "cast" _ args pos = do
     releaseDeferredCall
@@ -2158,8 +2165,12 @@ heapAlloc result sizeVar =
 -- converted to the type of the result variable.
 stackAlloc :: PrimArg -> Int -> LLVM ()
 stackAlloc result size = do
-    llvmAssignResult result $ "alloca i8, i64 " ++ show size
+    -- alloca returns a ptr (CPointer), but the result variable may have type
+    -- Bits wordSize (i64), so we assign to a CPointer temp first, then convert.
+    (writeTmp, readTmp) <- freshTempArgs $ Representation CPointer
+    llvmAssignResult writeTmp $ "alloca i8, i64 " ++ show size
         ++ ", align " ++ show wordSizeBytes
+    typeConvert readTmp result
     modify $ \s -> s { doesAlloca = True }
 
 

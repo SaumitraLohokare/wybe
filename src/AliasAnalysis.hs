@@ -9,7 +9,7 @@
 
 module AliasAnalysis (
     AliasMapLocal, AliasMapLocalItem(..), aliasSccBottomUp, currentAliasInfo,
-    isAliasInfoChanged, updateAliasedByPrim, isArgUnaliased,
+    isAliasInfoChanged, updateAliasedByPrim, isArgUnaliased, isArgEscaped,
     isArgVarUsedOnceInArgs, DeadCells, updateDeadCellsByAccessArgs,
     assignDeadCellsByAllocArgs
     ) where
@@ -524,6 +524,22 @@ isArgUnaliased aliasMap ArgVar{argVarName=varName, argVarFinal=final} =
         Nothing
 isArgUnaliased _ (ArgInt _ _) = Just []
 isArgUnaliased _ _ = Nothing
+
+
+-- | Check if the argument escapes the current procedure. It returns True if
+-- the variable is aliased to something outside the local scope, such as a
+-- global variable, an output parameter, or a maybe-aliased parameter.
+-- Non-variable args (constants, globals) are conservatively considered escaped.
+isArgEscaped :: AliasMapLocal -> PrimArg -> Bool
+isArgEscaped aliasMap ArgVar{argVarName=varName} =
+    let items = connectedItemsInDS (LiveVar varName) aliasMap |> Set.toList in
+    any (\case
+            AliasByGlobal _     -> True
+            AliasByParam _      -> True
+            MaybeAliasByParam _ -> True
+            _                   -> False
+        ) items
+isArgEscaped _ _ = True  -- conservatively consider non-variable args as escaped
 
 
 -- return True if the given arg is only used once in given list of arg.

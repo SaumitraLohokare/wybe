@@ -95,41 +95,80 @@ transformProcBody procDef speczVersion = do
                     |> List.filter (isOutputFlow . primParamFlow)
                     |> List.map primParamName |> List.map (\x -> (x,x))
                     |> Map.fromList
+    let escapingVars = computeEscapingVars proto body
     let tmp = procTmpCount procDef
     (_, tmp', _, _, _, body') <- buildBody tmp outVarSubs params $
-                transformBody proto body (aliasMap, Map.empty) callSiteMap
+                transformBody proto body (aliasMap, Map.empty) callSiteMap escapingVars
     return (body', tmp')
 
 
+-- | Compute the set of variable names whose values will eventually escape the
+-- current procedure via output parameters or global stores.  This is used to
+-- prevent stack-allocating a struct whose pointer is returned to the caller.
+--
+-- We start with the output parameter names and propagate backwards through
+-- mutation chains: if the *output* side of a mutate/move/cast escapes, the
+-- *input* side must also be heap-allocated.
+computeEscapingVars :: PrimProto -> ProcBody -> Set PrimVarName
+computeEscapingVars proto body =
+    let outputNames = Set.fromList
+            [ primParamName p
+            | p <- primProtoParams proto
+            , isOutputFlow (primParamFlow p) ]
+        allPrimsFlat = collectAllPrims body
+    in fixpointEscape allPrimsFlat outputNames
+  where
+    collectAllPrims (ProcBody prims fork) = prims ++ collectForkPrims fork
+    collectForkPrims NoFork = []
+    collectForkPrims (PrimFork _ _ _ bodies deflt) =
+        concatMap (collectAllPrims . snd) bodies
+        ++ maybe [] collectAllPrims deflt
+    collectForkPrims mf@MergedFork{} =
+        collectForkPrims (unMergeFork mf)
+    fixpointEscape prims escaped =
+        let escaped' = List.foldl propagateEscape escaped (List.map content prims)
+        in if escaped' == escaped then escaped else fixpointEscape prims escaped'
+    propagateEscape escaped (PrimForeign "lpvm" "mutate" _ (a:b:_))
+        | argIsVar b, argVarName b `Set.member` escaped
+        , argIsVar a = Set.insert (argVarName a) escaped
+    propagateEscape escaped (PrimForeign "llvm" "move" _ [src, dst])
+        | argIsVar dst, argVarName dst `Set.member` escaped
+        , argIsVar src = Set.insert (argVarName src) escaped
+    propagateEscape escaped (PrimForeign "lpvm" "cast" _ [src, dst])
+        | argIsVar dst, argVarName dst `Set.member` escaped
+        , argIsVar src = Set.insert (argVarName src) escaped
+    propagateEscape escaped _ = escaped
+
+
 transformBody :: PrimProto -> ProcBody -> (AliasMapLocal, DeadCells)
-        -> Map CallSiteID ProcSpec -> BodyBuilder ()
-transformBody caller body (aliasMap, deadCells) callSiteMap = do
+        -> Map CallSiteID ProcSpec -> Set PrimVarName -> BodyBuilder ()
+transformBody caller body (aliasMap, deadCells) callSiteMap escapingVars = do
     -- (1) Analysis of current caller's prims
     (aliaseMap', deadCells') <-
-            transformPrims caller body (aliasMap, deadCells) callSiteMap
+            transformPrims caller body (aliasMap, deadCells) callSiteMap escapingVars
 
     -- (2) Analysis of caller's bodyFork
     -- Update body while checking alias incurred by bodyfork
-    transformForks caller body (aliaseMap', deadCells') callSiteMap
+    transformForks caller body (aliaseMap', deadCells') callSiteMap escapingVars
 
 
 -- Check alias created by prims of caller proc
 transformPrims :: PrimProto -> ProcBody -> (AliasMapLocal, DeadCells)
-        -> Map CallSiteID ProcSpec
+        -> Map CallSiteID ProcSpec -> Set PrimVarName
         -> BodyBuilder (AliasMapLocal, DeadCells)
-transformPrims caller body (aliasMap, deadCells) callSiteMap = do
+transformPrims caller body (aliasMap, deadCells) callSiteMap escapingVars = do
     let prims = bodyPrims body
     -- Transform simple prims:
     lift $ logTransform "\nTransform prims (transformPrims):   "
-    foldM (transformPrim callSiteMap) (aliasMap, deadCells) prims
+    foldM (transformPrim callSiteMap escapingVars) (aliasMap, deadCells) prims
 
 
 -- Recursively transform forked body's prims
 -- PrimFork only appears at the end of a ProcBody
 -- PrimFork = NoFork | PrimFork {}
 transformForks :: PrimProto -> ProcBody -> (AliasMapLocal, DeadCells)
-        -> Map CallSiteID ProcSpec -> BodyBuilder ()
-transformForks caller body (aliasMap, deadCells) callSiteMap = do
+        -> Map CallSiteID ProcSpec -> Set PrimVarName -> BodyBuilder ()
+transformForks caller body (aliasMap, deadCells) callSiteMap escapingVars = do
     lift $ logTransform "\nTransform forks (transformForks):"
     let fork = bodyFork body
     case fork of
@@ -139,23 +178,23 @@ transformForks caller body (aliasMap, deadCells) callSiteMap = do
             mapM_ (\(brNum, currBody) -> do
                     beginBranch brNum
                     transformBody caller currBody
-                                (aliasMap, deadCells) callSiteMap
+                                (aliasMap, deadCells) callSiteMap escapingVars
                     endBranch
                 ) (List.map (mapFst Just) fBodies ++ maybeToList ((Nothing,) <$> deflt))
             completeFork
         MergedFork{} -> do
             lift $ logTransform "Unmerging fork:"
-            transformForks caller body{bodyFork=unMergeFork fork} (aliasMap, deadCells) callSiteMap
+            transformForks caller body{bodyFork=unMergeFork fork} (aliasMap, deadCells) callSiteMap escapingVars
         NoFork -> do
             -- NoFork: transform prims done
             lift $ logTransform "No fork."
 
 
 -- Build up alias pairs triggerred by proc calls
-transformPrim :: Map CallSiteID ProcSpec
+transformPrim :: Map CallSiteID ProcSpec -> Set PrimVarName
         -> (AliasMapLocal, DeadCells) -> Placed Prim
         -> BodyBuilder (AliasMapLocal, DeadCells)
-transformPrim callSiteMap (aliasMap, deadCells) prim = do
+transformPrim callSiteMap escapingVars (aliasMap, deadCells) prim = do
     -- XXX Redundent work here. We should change the current design.
     aliasMap' <- lift $ updateAliasedByPrim aliasMap prim
     lift $ logTransform $ "\n--- prim:           " ++ show prim
@@ -176,11 +215,24 @@ transformPrim callSiteMap (aliasMap, deadCells) prim = do
                 deadCells'
                     <- lift $ updateDeadCellsByAccessArgs (aliasMap, deadCells) args
                 return (primc, deadCells')
-            PrimForeign "lpvm" "alloc" _ args  -> do
+            PrimForeign "lpvm" "alloc" flags args  -> do
                 let (result, deadCells') =
                         assignDeadCellsByAllocArgs deadCells args
                 let primc' = case result of
-                        Nothing -> primc
+                        Nothing ->
+                            -- [Escape Analysis Check]
+                            -- If we couldn't reuse a dead cell, check if the
+                            -- allocation result escapes the current procedure.
+                            -- If not, and the size is a compile-time constant,
+                            -- flag it for stack allocation in the LLVM backend.
+                            let [sizeArg, outVar] = args in
+                            if not (isArgEscaped aliasMap outVar)
+                                    && not (argIsVar outVar
+                                            && argVarName outVar
+                                               `Set.member` escapingVars)
+                                    && argIsConst sizeArg
+                            then PrimForeign "lpvm" "alloc" ("stack":flags) args
+                            else primc
                         Just ((selectedCell, startOffset), []) ->
                             -- avoid "alloc" by reusing the "selectedCell".
                             let [_, varOut] = args in
