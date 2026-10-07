@@ -128,6 +128,7 @@ It may contain the following sorts of items:
   * [procedure definitions](#procedure-definitions),
   * [constructor declarations](#constructor-declarations),
   * [type declarations](#type-declarations),
+  * [trait declarations and implementations](#traits),
   * [resource declarations](#resource-declarations), and
   * [module declarations](#submodules).
 
@@ -1610,6 +1611,383 @@ two input lists must be the same, and the result will be a list of the same
 type.
 
 
+## <a name="traits"></a>Traits
+
+A *trait* specifies procedures or functions that a type must provide.  It lets a
+procedure work with any type that has the required procedures/functions, while
+retaining static type checking.  Trait calls are dispatched to the implementation
+for the concrete type supplied by the caller.
+
+A module becomes a trait by containing a `trait` declaration.  A trait cannot
+also declare a representation or constructors.  Its required procedures/functions
+are declared with `abstract`:
+
+```
+# formattable.wybe
+trait
+
+abstract fmt(x:_): string
+```
+
+As a convenience, a trait submodule can be declared with a `type` declaration:
+
+```
+type formattable trait {
+    abstract fmt(x:_): string
+}
+```
+
+This is equivalent to declaring a submodule named `formattable` whose first item
+is `trait`.
+
+An abstract procedure or function declaration has the same prototype syntax as
+an ordinary procedure or function declaration, but has no body.  It must appear
+inside a trait module and must identify exactly one type variable as the type
+that implements the enclosing trait. That type variable may occur in one or more
+parameters or in the result type.  The declaration may also use other type
+variables, provided they are not independently constrained by the enclosing
+trait.
+
+```
+type formattable trait {
+    abstract fmt(x:T<:formattable): string
+}
+```
+
+The `T<:formattable` notation means that `T` may be any type that implements the 
+trait `formattable`. Using a trait directly as a parameter type is a shorthand
+for a type variable constrained to that trait.  Therefore, the parameter type
+`T<:formattable` can be written as `formattable`.  Furthermore, since we have
+the `_` type, which is an alias for the type defined in the current module, the
+abstract function in the example above can be written as:
+
+```
+abstract fmt(x:_): string
+```
+
+More generally, a type variable in a regular procedure or function can
+be constrained by a named trait:
+
+```
+# In another module that is not `formattable`:
+def fmt_println(x:T<:formattable) use !io {
+    !println(fmt(x))
+}
+```
+
+Similarly, this can be written as:
+
+```
+def fmt_println(x:formattable) use !io {
+    !println(fmt(x))
+}
+```
+
+Trait constraints can be combined.  Here `T` must implement both `formattable`
+and `named`:
+
+```
+type named trait {
+    abstract name(x:_): string
+}
+
+def describe(x:T<:{formattable, named}): string =
+    "$(name(x)): $(fmt(x))"
+```
+
+Writing the constraint explicitly is useful when
+there is more than one parameter with the trait bound. 
+
+```
+def combine(x:formattable, y:formattable): string =
+    "$(fmt(x)), $(fmt(y))"
+
+# is equivalent to:
+
+def combine(x:T<:formattable, y:T): string =
+    "$(fmt(x)), $(fmt(y))"
+```
+
+Here `x` and `y` are given the same trait type, which implicitly specifies that
+both parameters must have the same concrete type.  If it is desired to have two
+or more parameters constrained to implement the current trait, but not 
+necessarily to have the same type, they must be written with the `<:` syntax,
+and specify different type variables:
+
+```
+def combine2(x:T<:formattable, y:T2<:formattable): string =
+    "$(fmt(x)), $(fmt(y))"
+```
+
+Traits may have type parameters.  In a top-level trait module, place the
+parameters after `trait`:
+
+```
+# collection.wybe
+trait(T)
+
+abstract insert(!collection:_(T), item:T)
+abstract contains(collection:_(T), item:T): bool
+```
+
+In the shorthand declaration, place the parameters after the trait name:
+
+```
+type collection(T) trait {
+    abstract insert(!collection:_(T), item:T)
+    abstract contains(collection:_(T), item:T): bool
+}
+```
+
+Each implementation supplies concrete arguments for those parameters, which
+specialise the signatures of the trait's abstract procedures and functions.
+For example, an integer set can implement `collection(int)`:
+
+```
+impl int_set <: collection(int)
+
+def insert(!set:int_set, item:int) { ... }
+def contains(set:int_set, item:int): bool = ...
+```
+
+Here the trait parameter `T` becomes `int`, while `_` becomes the
+implementing type, `int_set`.
+
+
+### Implementing a trait
+
+Declare that the type defined by the current module implements a trait with:
+
+> `impl` *trait*
+
+For example, a `dog` type can implement `formattable` as follows:
+
+```
+# dog.wybe
+use formattable
+
+impl formattable
+
+pub constructor dog(name:string)
+
+pub def fmt(x:_): string = "Dog($(x^name))"
+```
+
+Each abstract procedure or function in the trait module must have exactly one
+concrete (non-abstract) procedure or function that matches the signature of the
+abstract procedure/function, except that every occurrence of the trait type (or
+of a type variable with the trait as type bound) is replaced by the
+implementation type.  The implementation type may be generic, and the trait type
+may occur in any number of parameters.  The parameter flows, argument and
+result types, determinism, purity, and resource use of the concrete
+procedure/function must match the abstract declaration.
+
+An implementation for another type may be declared in any module with:
+
+> `impl` *type* `<:` *trait*
+
+To declare that a type implements multiple traits at once, enclose a
+comma-separated list of traits in braces:
+
+> `impl` *type* `<:` `{`*trait*`,` *trait*`, ...}`
+
+For example:
+
+```
+impl int <: {formattable, eq}
+```
+
+The braced form can also be used when implementing multiple traits for the type
+defined by the current module:
+
+```
+impl {formattable, eq}
+```
+
+For example, this makes `int` implement a trait declared in a submodule:
+
+```
+type formattable trait {
+    abstract fmt(x:_): string
+}
+
+impl int <: formattable
+
+def fmt(x:int): string = "$x"
+```
+
+The implementation procedures are resolved in the module containing the
+`impl` declaration, and they can come from imported modules.  If multiple
+matching procedures exist, one is defined locally and others are imported from
+elsewhere, then the local matching procedure is preferred.
+
+The implementation type in an `impl` declaration may itself be generic, so
+that a single declaration covers every instantiation of the type.  Here
+`list(T)` implements the `collection(T)` trait defined earlier, for every
+element type:
+
+```
+impl list(T) <: collection(T)
+
+def insert(!lst:list(T), item:T) { ... }
+def contains(lst:list(T), item:T): bool = ...
+```
+
+Thus `list(int)` implements `collection(int)`, `list(string)` implements
+`collection(string)`, and so on, with a single generic vtable shared by all
+instantiations.
+
+The implementation type may also be a bare type variable, giving a generic
+implementation that applies to any type.  With the `named` trait defined
+earlier, this gives every type a default name:
+
+```
+impl T <: named
+
+def name(x:T): string = "<unknown>"
+```
+
+Every type variable appearing in the trait must also appear in the
+implementation type.  A generic implementation is used only when no
+implementation with an exactly matching type is known.  Thus, with the
+generic implementation of `named` above, the following causes
+`named.name(42)` to use the `int` implementation and return `"int"`, while
+other types continue to use the generic implementation and return
+`"<unknown>"`, regardless of the order in which the two implementations are
+declared:
+
+```
+impl int <: named
+
+def name(x:int): string = "int"
+```
+
+The implementing procedures and functions must match the signatures of the
+specialised abstract procedures and functions.  In particular, a generic
+procedure does not implement a trait for a concrete type: `def name(x:T):
+string` does not satisfy `impl int <: named`.
+
+Type variables in the implementation type may have trait bounds.  Such a
+bounded generic implementation applies only when the corresponding concrete
+type implements every bound.  For example:
+
+```
+type box(T) {
+    pub box(value:T)
+}
+
+impl box(named) <: formattable
+
+def fmt(x:box(named)): string = "box of " ,, name(x^value)
+```
+
+where `box(named)` is an abbreviation for `box(T<:named)`.
+
+This implementation of `formattable` applies to `box(int)` if `int` implements
+`named`, but not to `box(U)` when `U` does not.  The same bounds must be
+written on the type variables in the implementing procedures and functions.
+Bounds constrain variables in the implementation type; type variables in the
+implemented trait cannot introduce additional bounds.
+
+The implementation type may also be a trait, so that every type implementing
+one trait also implements another:
+
+```
+impl named <: formattable
+
+def fmt(x:named): string = "<" ,, name(x) ,, ">"
+```
+
+As with parameter types, a trait used as the implementation type abbreviates a
+type variable bounded by that trait, so the declaration above is equivalent to:
+
+```
+impl T<:named <: formattable
+
+def fmt(x:T<:named): string = "<" ,, name(x) ,, ">"
+```
+
+The explicit form allows the type variable to have several bounds, so that the
+implementation applies only to types implementing all of them.  For example,
+any type that has both a name and a price can be listed in a shop:
+
+```
+type priced trait {
+    abstract price(x:_): int
+}
+
+type listable trait {
+    abstract listing(x:_): string
+}
+
+impl T<:{named, priced} <: listable
+
+def listing(x:T<:{named, priced}): string =
+    named.name(x) ,, " costs $(priced.price(x))"
+```
+
+When more than one implementation applies, Wybe selects the unique most
+specific one.  A concrete implementation is more specific than a bounded
+generic implementation, which is more specific than the corresponding
+unbounded generic implementation.  Implementations with independent bounds
+may overlap without error, but using a type in their overlap is ambiguous if
+neither implementation is more specific.  A further implementation covering
+the intersection can resolve the ambiguity.  For example, given generic
+`pair(A,B)` and trait `formattable`:
+
+```
+impl pair(named, B) <: formattable
+impl pair(A, named) <: formattable
+impl pair(A<:named, B<:named) <: formattable
+```
+
+The third declaration is selected when both type arguments implement
+`named`; without it, selecting a `formattable` implementation for such a pair
+would be ambiguous.
+
+### Default trait implementations
+
+A trait may give an abstract procedure or function a default implementation by
+declaring a public concrete procedure or function in the trait module with the
+same signature.  Types implementing the trait use that default unless their
+implementation module supplies its own matching procedure/function. 
+
+For example, the formattable trait can provide a generic default for fmt:
+
+```
+# formattable.wybe
+trait
+
+abstract fmt(x:_): string
+
+pub def fmt(x:_): string = "<value>"
+```
+
+The existing dog type provides its own implementation, which overrides the
+default:
+
+```
+# dog.wybe
+
+use formattable
+
+impl formattable
+
+pub constructor dog(name:string)
+
+pub def fmt(x:_): string = "Dog($(x^name))"
+```
+
+Another existing type can implement the trait without defining `fmt`:
+
+```
+impl int <: formattable
+```
+
+Consequently, `fmt(dog("Fido"))` returns "Dog(Fido)", using the implementation
+defined for `dog`, while `fmt(42)` returns "\<value\>", using the default
+implementation from `formattable`.
+
 ## <a name="resources"></a>Resources
 
 Resources provide an alternative argument passing mechanism,
@@ -1654,6 +2032,20 @@ one another, the order in which their resources are initialised is unspecified.
 A resource may be exported, allowing it to be referred to in other modules, by
 preceding the `resource` declaration with the `pub` keyword.
 
+### <a name="compound-resource-declarations"></a>Declaring a compound resource
+
+Resources can be defined to be the union of other resources.
+Such resources are called *compound* resources.
+The syntax for declaring compound resources is as follows:
+
+> `resource` *name* `=` *resource*, ...
+
+Note the lack of type when specifying a compound resource, which must include at
+least one other resource, but may include many, separated by commas.
+Included resources can include any combination of *simple* resources, as
+described above, and other compound resources.
+Two compound resources, however, cannot depend on each other.
+
 ### Defining a resourceful procedure
 
 Any procedure may declare that it uses any number of resources,
@@ -1671,13 +2063,20 @@ corresponding resource; as for parameters, no flow prefix indicates that the
 resource is only an input, a question mark (`?`) indicates it is only an output,
 and an exclamation point (`!`) indicates that the resource is both input and
 output.
+The set of resources available in the procedure is the union of all the
+resources and flow directions specified.
+In the case of [compound resources](#compound-resource-declarations),
+the specified flow direction is applied to all resources included in that
+resource.
 The order in which the resources are listed is not significant, and any number
 of resources may be specified.
-This allows the resource name to be used as a local variable in the procedure
+This allows the *simple* resource names to be used as a local variable in the procedure
 body, just as if it were an ordinary parameter.
+Compound resource names cannot be used as variables, since they specify,
+directly or indirectly, a set of simple resources.
 
-Importantly, resources available in a procedure become available in any
-procedures it calls that also declare that they `use` that resource.
+Importantly, the simple resources available in a procedure become available in
+any procedures it calls that also declare that they `use` that resource.
 
 ### <a name="calling-resourceful"></a>Calling a resourceful procedure
 

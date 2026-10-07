@@ -15,7 +15,7 @@ import AST
 import Config (wordSize, wordSizeBytes, availableTagBits,
                tagMask, smallestAllocatedAddress, currentModuleAlias, specialName2, specialName, initProcName, byteBits)
 import Control.Monad
-import Control.Monad.State (gets)
+import Control.Monad.State (gets, evalStateT)
 import Control.Monad.Trans (lift,liftIO)
 import Control.Monad.Extra (concatMapM)
 import Data.List as List
@@ -29,6 +29,7 @@ import Data.Tuple.Select
 import Flatten (flattenProcBody)
 import Options (LogSelection(Normalise))
 import Snippets
+import Types (canonicalise)
 import Util
 import Distribution.Parsec.FieldLineStream (fieldLineStreamEnd)
 import UnivSet (UnivSet(FiniteSet, UniversalSet))
@@ -72,6 +73,10 @@ normaliseItem (RepresentationDecl params mods rep pos) = do
     updateTypeModifiers mods
     addParameters (RealTypeVar <$> params) pos
     addTypeRep rep pos
+normaliseItem (TraitDecl params mods pos) = do
+    updateTypeModifiers mods
+    addParameters (RealTypeVar <$> params) pos
+    addTrait pos
 normaliseItem (ConstructorDecl vis params mods ctors pos) = do
     updateTypeModifiers mods
     addParameters (RealTypeVar <$> params) pos
@@ -89,8 +94,8 @@ normaliseItem (ImportForeign files _) =
     mapM_ addForeignImport files
 normaliseItem (ImportForeignLib files _) =
     mapM_ addForeignLib files
-normaliseItem (ResourceDecl vis name typ init pos) = do
-  addSimpleResource name (SimpleResource typ init pos) vis
+normaliseItem (ResourceDecl vis name defn pos) =
+  addResource name vis defn pos
 normaliseItem (FuncDecl vis mods (ProcProto name params resources) resulttype
     (Placed (Where body (Placed (Var var ParamOut rflow) _)) _) pos) =
     -- Handle special reverse mode case of def foo(...) = var where ....
@@ -137,14 +142,127 @@ normaliseItem (ForeignProcDecl vis lang mods mbAlias proto@(ProcProto name param
                     resources
     params' = params
         ++ [Param outputVariableName resulttype ParamOut Ordinary `maybePlace` pos | resulttype /= AnyType]
+normaliseItem (AbstractProcDecl mods proto@(ProcProto name params resources) resulttype pos) = do
+    when (mods{modifierImpurity=Pure, modifierDetism=Det} /= defaultProcModifiers)
+        $ errmsg pos
+        $ "Abstract procedure declaration of " ++ name
+            ++ " has illegal procedure modifiers. Only purity and determinism can be specified."
+    mapM_ ((\(Param{paramType=ty, paramName=name}, pos) -> do
+            when (ty == AnyType)
+                $ errmsg pos
+                $ "Abstract procedure declaration parameters must be typed, but " ++ name ++ " is untyped."
+        ) . unPlace) params
+    addAbstractProc 0 (AbstractProcDecl mods proto{procProtoParams=params'} resulttype pos)
+
+  where
+    params' = params
+        ++ [Param outputVariableName resulttype ParamOut Ordinary `maybePlace` pos | resulttype /= AnyType]
 normaliseItem item@ProcDecl{} = do
     logNormalise $ "Recording proc without flattening:" ++ show item
     addProc 0 item
 normaliseItem (StmtDecl stmt pos) = do
     logNormalise $ "Normalising statement decl " ++ show stmt
     updateModule (\s -> s { stmtDecls = maybePlace stmt pos : stmtDecls s})
+normaliseItem (TraitImpl typ traits pos) = do
+    let typ' = fromMaybe (TypeSpec [] currentModuleAlias []) typ
+        implVars = typeVarSet typ'
+        traitVars = Set.unions $ typeVarSet <$> traits
+        undeclaredVars = traitVars `Set.difference` implVars
+    unless (Set.null undeclaredVars) $
+        errmsg pos $ "Invalid generic trait implementation: type variable(s) "
+            ++ intercalate ", " (show <$> Set.toAscList undeclaredVars)
+            ++ " not defined in the implementation type"
+    when (any hasTypeVarBounds traits) $
+        errmsg pos $ "Invalid partial trait implementation: type variable "
+            ++ "bounds are only permitted in the implementation type"
+    mapM_ (\trait -> addTraitImpl pos (TraitImplSpec trait typ')) traits
+  where
+    hasTypeVarBounds TypeVariable{typeVariableBounds=bounds} =
+        not $ Set.null bounds
+    hasTypeVarBounds TypeSpec{typeParams=params} = any hasTypeVarBounds params
+    hasTypeVarBounds HigherOrderType{higherTypeParams=flows} =
+        any (hasTypeVarBounds . typeFlowType) flows
+    hasTypeVarBounds _ = False
 normaliseItem (PragmaDecl prag) =
     addPragma prag
+
+
+-- |Resolve this module's trait implementations and publish them in its interface.
+normaliseTraitImpls :: Compiler ()
+normaliseTraitImpls = do
+    knownTraitImpls <- getModuleImplementationField modKnownTraitImpls
+    normalised <- traverse (uncurry normaliseTraitImpl)
+        $ Map.toList knownTraitImpls
+    knownTraitImpls' <- foldM insertNormalisedTraitImpl Map.empty normalised
+    updateImplementation (\impl -> impl{ modKnownTraitImpls=knownTraitImpls' })
+    publishTraitImpls
+
+
+-- |Insert a normalised trait implementation.  Distinct raw declarations can
+-- resolve to the same specification through qualification, aliases, or
+-- generic-variable canonicalisation.  Keep the earliest local declaration and
+-- warn at the later one.
+insertNormalisedTraitImpl :: Map TraitImplSpec KnownTraitImpl
+    -> (TraitImplSpec, KnownTraitImpl)
+    -> Compiler (Map TraitImplSpec KnownTraitImpl)
+insertNormalisedTraitImpl impls candidate@(spec, owner) =
+    case Map.lookup spec impls of
+        Nothing -> return $ uncurry Map.insert candidate impls
+        Just previous
+          | isNothing (traitImplMod owner)
+                && isNothing (traitImplMod previous) -> do
+                let (kept, duplicate)
+                        | owner `isEarlierThan` previous = (owner, previous)
+                        | otherwise = (previous, owner)
+                warnmsg (traitImplPos duplicate) $
+                    "Duplicate trait implementation declaration: " ++ show spec
+                return $ Map.insert spec kept impls
+          | isNothing (traitImplMod owner) ->
+                return $ Map.insert spec owner impls
+          | otherwise -> return impls
+  where
+    isEarlierThan first second =
+        case (traitImplPos first, traitImplPos second) of
+            (Just firstPos, Just secondPos) -> firstPos < secondPos
+            (Just _, Nothing) -> True
+            _ -> False
+
+
+-- |Resolve an unqualified trait impl specification once its defining module is known.
+normaliseTraitImpl :: TraitImplSpec -> KnownTraitImpl -> Compiler (TraitImplSpec, KnownTraitImpl)
+normaliseTraitImpl ispec@(TraitImplSpec trait typ) impl =
+    case traitImplMod impl of
+        Just _ -> return (canonicaliseTraitImplSpec ispec, impl)
+        Nothing -> do
+            typ' <- lookupType "trait impl" Nothing typ
+                >>= flip evalStateT (TraitTypeVars Map.empty 0)
+                    . traitTypesToTypeVars
+            trait' <- lookupType "trait impl" Nothing trait
+            forM_ (traitImplTypeBounds $ TraitImplSpec trait' typ') $ \(_, bound) -> do
+                validBound <- isTraitType bound
+                unless validBound $ errmsg (traitImplPos impl) $
+                    "Invalid partial trait implementation bound: "
+                        ++ show bound ++ " is not a trait"
+            validTrait <- isTraitType trait'
+            unless validTrait $ errmsg (traitImplPos impl) $
+                "Invalid trait implementation: " ++ show trait' ++ " is not a trait"
+            return (canonicaliseTraitImplSpec $ TraitImplSpec trait' typ', impl)
+  where
+    canonicaliseTraitImplSpec (TraitImplSpec trait typ) =
+        let (([typ', trait'], canonicalBounds), _) =
+                canonicalise 0 Map.empty [typ, trait]
+        in TraitImplSpec trait' $ restoreBounds canonicalBounds typ'
+    restoreBounds bounds ty@TypeVariable{typeVariableName=name} =
+        case Map.lookup name bounds of
+            Just (Right traits) -> ty { typeVariableBounds = traits }
+            _ -> ty
+    restoreBounds bounds ty@TypeSpec{typeParams=params} =
+        ty { typeParams = restoreBounds bounds <$> params }
+    restoreBounds bounds ty@HigherOrderType{higherTypeParams=flows} =
+        ty { higherTypeParams = restoreFlow bounds <$> flows }
+    restoreBounds _ ty = ty
+    restoreFlow bounds flow =
+        flow { typeFlowType = restoreBounds bounds $ typeFlowType flow }
 
 
 -- |Normalise a nested submodule containing the specified items.
@@ -196,6 +314,7 @@ completeNormalisation modSCC = do
     completeTypeNormalisation modSCC
     mapM_ (normaliseModMain modSCC `inModule`) modSCC
     mapM_ (transformModuleProcs flattenProcBody) modSCC
+    mapM_ (normaliseTraitImpls `inModule`) modSCC
 
 
 -- | Layout the types on the specified module list, which comprise a strongly
@@ -222,7 +341,7 @@ completeNormalisation modSCC = do
 completeTypeNormalisation :: [ModSpec] -> Compiler ()
 completeTypeNormalisation mods = do
     mods' <- filterM (getSpecModule "completeTypeNormalisation"
-                      (modIsType &&& isNothing . modTypeRep)) mods
+                      (modIsType &&& isNothing . modTypeRep &&& isNothing . modTrait)) mods
     typeSCCs <- modSCCTypeDeps mods'
     logNormalise $ "Ordered type dependency SCCs: " ++ show typeSCCs
     mapM_ completeTypeSCC typeSCCs
@@ -265,20 +384,35 @@ modTypeDeps modSet = do
     tyParams <- getModule modParams
     ctorsVis <- reverse . trustFromJust "modTypeDeps"
                <$> getModuleImplementationField modConstructors
-    ctors <- mapM (placedApply resolveCtorTypes . snd) ctorsVis
+    (ctors, checkedCtors) <-
+        mapAndUnzipM (placedApply resolveCtorTypes . snd) ctorsVis
     let deps = List.filter (`Set.member` modSet)
                $ concatMap
                  (catMaybes . (typeModule . paramType . content <$>)
                   . procProtoParams . content)
                  ctors
-    return ((tyMod, TypeDef tyParams ctorsVis), tyMod, deps)
+    let ctorsVis' = zip (fst <$> ctorsVis) checkedCtors
+    return ((tyMod, TypeDef tyParams ctorsVis'), tyMod, deps)
 
 
--- | Resolve constructor argument types.
-resolveCtorTypes :: ProcProto -> OptPos -> Compiler (Placed ProcProto)
+-- | Resolve constructor argument types, and report any trait bounds in them,
+-- which are not allowed.  Returns the resolved constructor, and the
+-- constructor as written with only its offending argument types replaced.
+resolveCtorTypes :: ProcProto -> OptPos
+                 -> Compiler (Placed ProcProto, Placed ProcProto)
 resolveCtorTypes proto pos = do
-    params <- mapM (placedApplyM resolveParamType) $ procProtoParams proto
-    return $ maybePlace (proto { procProtoParams = params }) pos
+    let params = procProtoParams proto
+        checkParamType written resolved = do
+            let Param{paramType=ty} = content resolved
+                ppos = place resolved
+            ty' <- rejectTraitBounds "a constructor parameter" ppos ty
+            return $ if ty' == ty
+                then written
+                else contentApply (\param -> param { paramType = ty' }) written
+    resolved <- mapM (placedApplyM resolveParamType) params
+    checked <- zipWithM checkParamType params resolved
+    return (maybePlace (proto { procProtoParams = resolved }) pos,
+            maybePlace (proto { procProtoParams = checked }) pos)
 
 
 -- | Resolve the type of a parameter
@@ -398,7 +532,7 @@ completeType modspec (TypeDef params ctors) = do
     when (numConsts >= fromIntegral smallestAllocatedAddress)
       $ nyi $ "Type '" ++ show modspec ++ "' has too many constant constructors"
 
-    let typespec = TypeSpec [] currentModuleAlias $ List.map TypeVariable params
+    let typespec = TypeSpec [] currentModuleAlias $ List.map (`TypeVariable` Set.empty) params
 
     let constItems = concatMap (constCtorItems typespec) $ zip constCtors [0..]
 
@@ -701,6 +835,11 @@ constructorItems vis ctorName typeSpec params fields size tag tagLimit pos =
            varSetTyped recName typeSpec `maybePlace` pos]) pos]
          ++
          -- fill in the secondary tag, if necessary
+         -- fill in the secondary tag, if necessary
+         -- fill in the secondary tag, if necessary
+         -- fill in the secondary tag, if necessary
+         
+         -- fill in the secondary tag, if necessary
          ([maybePlace (ForeignCall "lpvm" "mutate" []
             [varGetTyped recName typeSpec `maybePlace` pos,
               varSetTyped recName typeSpec `maybePlace` pos,
@@ -711,6 +850,11 @@ constructorItems vis ctorName typeSpec params fields size tag tagLimit pos =
               Unplaced $ iVal tag]) pos
           | tag > tagLimit])
          ++
+         -- Code to fill all the fields
+         -- Code to fill all the fields
+         -- Code to fill all the fields
+         -- Code to fill all the fields
+         
          -- Code to fill all the fields
          List.map
           (\(FieldInfo var pPos _ ty _ offset _) ->
@@ -724,6 +868,8 @@ constructorItems vis ctorName typeSpec params fields size tag tagLimit pos =
                   varGetTyped var ty `maybePlace` pPos]) pos)
           fields
          ++
+         -- Finally, code to tag the reference
+         -- Finally, code to tag the reference
          -- Finally, code to tag the reference
          [maybePlace (ForeignCall "llvm" "or" []
            [varGetTyped recName typeSpec `maybePlace` pos,
@@ -779,6 +925,11 @@ tagCheck pos numConsts numNonConsts tag tagBits tagLimit size varName =
                      (intCast $ iVal numConsts)]
            ++
            -- If there is more than one non-const constructors, check that
+           -- If there is more than one non-const constructors, check that
+           -- it's the right one
+           -- it's the right one
+           
+           -- If there is more than one non-const constructors, check that
            -- it's the right one
            (case numNonConsts of
                1 -> []  -- Nothing to do if it's the only non-const constructor
@@ -789,6 +940,7 @@ tagCheck pos numConsts numNonConsts tag tagBits tagLimit size varName =
                                       then wordSizeBytes-1
                                       else tag) `withType` tagTy)])
            ++
+           -- If there's a secondary tag, check that, too.
            -- If there's a secondary tag, check that, too.
            if tag > tagLimit
            then [maybePlace (ForeignCall "lpvm" "access" [] [varGet varName `maybePlace` pos,
@@ -863,6 +1015,11 @@ unboxedConstructorItems vis ctorName typeSpec tag nonConstBit fields pos =
            `maybePlace` pos]
          ++
          -- Shift each field into place and or with the result
+         -- Shift each field into place and or with the result
+         -- Shift each field into place and or with the result
+         -- Shift each field into place and or with the result
+         
+         -- Shift each field into place and or with the result
          List.concatMap
           (\(FieldInfo var pPos _ ty _ shift sz) ->
                [maybePlace (ForeignCall "lpvm" "cast" []
@@ -879,6 +1036,15 @@ unboxedConstructorItems vis ctorName typeSpec tag nonConstBit fields pos =
                 pos])
           fields
          ++
+         -- Or in the bit to ensure the value is greater than the greatest
+         -- Or in the bit to ensure the value is greater than the greatest
+         -- Or in the bit to ensure the value is greater than the greatest
+         -- Or in the bit to ensure the value is greater than the greatest
+         -- possible const value, if necessary
+         -- possible const value, if necessary
+         -- possible const value, if necessary
+         -- possible const value, if necessary
+         
          -- Or in the bit to ensure the value is greater than the greatest
          -- possible const value, if necessary
          (case nonConstBit of

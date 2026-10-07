@@ -17,16 +17,24 @@
 --  This also includes the Compiler monad and the Module types.
 module AST (
   -- *Types just for parsing
-  Item(..), Visibility(..), isPublic,
+  Item(..), Visibility(..), ResourceDefn(..), isPublic,
   Determinism(..), determinismLEQ, determinismJoin, determinismMeet,
   disjunctionDeterminism, determinismFail, determinismSucceed,
   determinismSeq, determinismProceding, determinismName, determinismCanFail,
   impurityName, impuritySeq, expectedImpurity,
   inliningName,
+  TraitSpec, TraitImplSpec(..), KnownTraitImpl(..), traitImplModule,
+  TraitImplResolution(..), TypeVarBound,
+  resolveTraitImpl, lookupTraitImpl, traitImplMoreSpecific,
+  typePatternsMoreGeneral, specialiseTraitImpl,
+  traitImplTypeBounds, traitImplConstraints,
+  traitImplConstraintsFor, canonicalise, sameTraitConstraint,
   TypeProto(..), TypeModifiers(..), TypeSpec(..), typeVarSet, TypeVarName(..),
   genericType, higherOrderType, isHigherOrder,
-  isResourcefulHigherOrder, typeModule,
-  VarDict, TypeImpln(..),
+  isResourcefulHigherOrder, isTraitType, typeModule,
+  TraitTypeVars(..), traitTypesToTypeVars, rejectTraitBounds,
+  traitBoundNotAllowedMsg,
+  VarDict, TypeVarDict, TypeImpln(..),
   ProcProto(..), Param(..), TypeFlow(..),
   paramTypeFlow, primParamTypeFlow, setParamArgFlowType,
   paramToVar, primParamToArg, unzipTypeFlow, unzipTypeFlows,
@@ -36,7 +44,8 @@ module AST (
   flattenedExpFlow, expIsVar, expIsConstant, expVar, expVar', maybeExpType, innerExp,
   setExpFlowType,
   TypeRepresentation(..), TypeFamily(..), typeFamily,
-  defaultTypeRepresentation, typeRepSize, integerTypeRep, typeSize, 
+  defaultTypeRepresentation, typeRepSize, integerTypeRep, typeSize,
+  typeNeedsBoxing,
   defaultTypeModifiers, lookupTypeRepresentation, typeRepresentation,
   lookupModuleRepresentation, argIsReal,
   paramIsPhantom, argIsPhantom, typeIsPhantom, repIsPhantom,
@@ -53,7 +62,7 @@ module AST (
   lookupConstStruct, lookupConstInfo, cStringExpr,
   StructInfo(..), ConstValue(..), constValueSize, constantValue, closureStructId, constValueRepresentation,
   constValueAtOffset, constValuePrimArg, constValueExp,
-  ImportSpec(..), importSpec, Pragma(..), addPragma,
+  ImportSpec(..), ImportPhase(..), importSpec, Pragma(..), addPragma,
   descendentModules, sameOriginModules,
   refersTo,
   enterModule, reenterModule, exitModule, reexitModule, inModule,
@@ -70,7 +79,7 @@ module AST (
   speczVersionToId, SpeczProcBodies,
   MultiSpeczDepInfo, CallSiteProperty(..), InterestingCallProperty(..),
   ProcAnalysis(..), emptyProcAnalysis,
-  ProcBody(..), PrimFork(..), MergedForkTable, prependToBody, appendToBody, unMergeFork, guardedMergedFork, 
+  ProcBody(..), PrimFork(..), MergedForkTable, prependToBody, appendToBody, unMergeFork, guardedMergedFork,
   Ident, VarName, ProcName, ResourceDef(..), FlowDirection(..), showFlowName,
   argFlowDirection, argType, setArgType, setArgFlow, setArgFlowType, maybeArgFlowType,
   argDescription, argIntVal, trustArgInt, setParamType, paramIsResourceful,
@@ -94,7 +103,7 @@ module AST (
   CompilerState(..), Compiler, runCompiler,
   updateModules, updateImplementations, updateImplementation,
   updateTypeModifiers,
-  addParameters, addTypeRep, setTypeRep, addConstructor,
+  addParameters, addTypeRep, setTypeRep, addTrait, addConstructor,
   getModuleImplementationField, getModuleImplementation,
   getLoadedModule, getLoadingModule, updateLoadedModule, updateLoadedModuleM,
   getLoadedModuleImpln, updateLoadedModuleImpln, updateLoadedModuleImplnM,
@@ -104,22 +113,23 @@ module AST (
   updateModInterface, updateAllProcs, updateModSubmods, updateModProcs,
   getModuleSpec, moduleIsType, option,
   getOrigin, getSource, getDirectory,
-  optionallyPutStr, message, errmsg, (<!>), prettyPos, Message(..), queueMessage,
-  genProcName, addImport, doImport, importFromSupermodule, lookupType, lookupType',
-  typeIsUnique,
-  ResourceName, ResourceSpec(..), ResourceFlowSpec(..), ResourceImpln(..),
+  optionallyPutStr, message, errmsg, warnmsg, (<!>), prettyPos,
+  Message(..), queueMessage,
+  genProcName, addImport, doImport, importFromSupermodule, publishTraitImpls,
+  lookupType, lookupType', typeIsUnique,
+  ResourceName, ResourceSpec(..), ResourceFlowSpec(..), PrimResourceImpln(..),
   initialisedResources, initialisedVisibleResources,
-  addSimpleResource, lookupResource,
+  addResource, lookupResourceSpec, lookupResource,
   specialResources, specialResourcesSet, isSpecialResource,
   publicResource, resourcefulName,
   ProcModifiers(..), defaultProcModifiers,
   setDetism, setInline, setImpurity, setVariant,
   ProcVariant(..), Inlining(..), Impurity(..),
-  addProc, addProcDef, lookupProc, publicProc, callTargets,
-  outputVariableName, outputStatusName,
+  addProc, addProcDef, addAbstractProc, addTraitImpl, lookupProc, publicProc, callTargets,
+  abstractProcs, traitImplProcProto, outputVariableName, outputStatusName,
   envParamName, envPrimParam, makeGlobalResourceName,
   showBody, showPlacedPrims, showStmt, showBlock, showProcDef,
-  showProcIdentifier, showProcName,
+  showProcIdentifier, showProcName, showProcOrVarName,
   showModSpec, showModSpecs, showResources, showOptPos, showProcDefs, showUse,
   shouldnt, should, nyi, checkError, checkValue, trustFromJust, trustFromJustM,
   flowPrefix, showProcModifiers, showProcModifiers', showFlags, showFlags',
@@ -156,7 +166,9 @@ import Data.Map as Map
       findWithDefault,
       foldr,
       fromList,
+      fromListWith,
       insert,
+      insertWith,
       keys,
       keysSet,
       lookup,
@@ -175,7 +187,7 @@ import           UnivSet as USet
 import           Data.Tuple.HT ( mapSnd, mapFst )
 import           Data.Word (Word8)
 import           Data.Char
-import           Text.Read (readMaybe)
+import           Data.Functor     ((<&>))
 import           Flow             ((|>))
 import           Numeric          (showHex)
 import           Options
@@ -183,16 +195,13 @@ import           System.Exit
 import           System.FilePath
 import           System.IO
 import           System.Directory (makeAbsolute, makeRelativeToCurrentDirectory)
--- import           Text.ParserCombinators.Parsec.Pos
 import           Text.Parsec.Pos
                  ( SourcePos, sourceName, sourceColumn, sourceLine )
 import           Util
 import           System.Console.ANSI
-
+import           Data.Binary (Binary)
 import           GHC.Generics (Generic)
-
-import Data.Binary (Binary)
-import Data.Functor ((<&>))
+import           GHC.Stack (HasCallStack)
 
 
 ----------------------------------------------------------------
@@ -204,23 +213,33 @@ data Item
      = TypeDecl Visibility TypeProto TypeModifiers TypeImpln [Item] OptPos
      | ModuleDecl Visibility Ident [Item] OptPos
      | RepresentationDecl [Ident] TypeModifiers TypeRepresentation OptPos
+     | TraitDecl [Ident] TypeModifiers OptPos
      | ConstructorDecl Visibility [Ident] TypeModifiers [(Visibility, Placed ProcProto)]
                        OptPos
      | ImportMods Visibility [ModSpec] OptPos
      | ImportItems Visibility ModSpec [Ident] OptPos
      | ImportForeign [FilePath] OptPos
      | ImportForeignLib [Ident] OptPos
-     | ResourceDecl Visibility ResourceName TypeSpec (Maybe (Placed Exp)) OptPos
+     | ResourceDecl Visibility ResourceName ResourceDefn OptPos
      | FuncDecl Visibility ProcModifiers ProcProto TypeSpec (Placed Exp) OptPos
      | ProcDecl Visibility ProcModifiers ProcProto [Placed Stmt] OptPos
      | ForeignProcDecl Visibility Ident ProcModifiers (Maybe Ident) ProcProto TypeSpec OptPos
+     | AbstractProcDecl ProcModifiers ProcProto TypeSpec OptPos
      | StmtDecl Stmt OptPos
+     | TraitImpl (Maybe TypeSpec) [TraitSpec] OptPos
      | PragmaDecl Pragma
      deriving (Generic, Eq)
 
 -- |The visibility of a file item.  We only support public and private.
 data Visibility = Private | Public
                   deriving (Eq, Ord, Show, Generic)
+
+
+data ResourceDefn =
+    SimpleResourceDefn TypeSpec (Maybe (Placed Exp))
+    | CompoundResourceDefn [ResourceSpec]
+    deriving (Eq, Ord, Show, Generic)
+
 
 
 -- |Determinism describes whether a statement can succeed or fail if execution
@@ -619,11 +638,14 @@ updateLoadedModuleM updater modspec = do
 
 
 -- |Return the ModuleImplementation of the specified module.  An error
--- if the module is not loaded or does not have an implementation.
+-- if the module is not already loaded (or currently being loaded), or does not
+-- have an implementation.
 getLoadedModuleImpln :: ModSpec -> Compiler ModuleImplementation
 getLoadedModuleImpln modspec = do
-    mod <- trustFromJustM ("unknown module " ++ showModSpec modspec) $
-           getLoadingModule modspec
+    loadingMod <- getLoadingModule modspec
+    mod <- trustFromJust ("getLoadedModuleImpln " ++ showModSpec modspec)
+            . (`orElse` loadingMod) . find ((== modspec) . modSpec)
+            <$> gets underCompilation
     return $ trustFromJust ("unimplemented module " ++ showModSpec modspec) $
            modImplementation mod
 
@@ -901,13 +923,14 @@ addParameters params pos = do
 
 
 -- |Add the specified type representation to the current module.  This makes the
--- module a type.  Checks that the type doesn't already have a representation or
--- constructors defined.
+-- module a type.  Checks that the type doesn't already have a representation,
+-- constructors or trait defined.
 addTypeRep :: TypeRepresentation -> OptPos -> Compiler ()
 addTypeRep repn pos = do
     currMod <- getModuleSpec
     hasRepn <- isJust <$> getModule modTypeRep
     hasCtors <- isJust <$> getModuleImplementationField modConstructors
+    hasTrait <- isJust <$> getModule modTrait
     if hasRepn
       then errmsg pos
            $ "Multiple representations specified for type " ++ show currMod
@@ -915,6 +938,9 @@ addTypeRep repn pos = do
       then errmsg pos
            $ "Can't declare representation of type " ++ show currMod
              ++ " with constructors"
+      else if hasTrait
+      then errmsg pos
+           $ "Can't declare representation of trait type " ++ show currMod
       else do
         setTypeRep repn (Just $ typeRepSize repn)
         addKnownType currMod
@@ -927,6 +953,37 @@ setTypeRep repn size = do
                           , modIsType  = True })
 
 
+-- |Add the specified trait to the current module.  This makes the
+-- module a type.  Checks that the type doesn't already have a representation or
+-- constructors defined.
+addTrait :: OptPos -> Compiler ()
+addTrait pos = do
+    currMod <- getModuleSpec
+    hasRepn <- isJust <$> getModule modTypeRep
+    hasCtors <- isJust <$> getModuleImplementationField modConstructors
+    hasTrait <- isJust <$> getModule modTrait
+    if hasRepn
+      then errmsg pos
+           $ "Can't declare trait type " ++ showModSpec currMod
+           ++ " with declared representation"
+      else if hasCtors
+      then errmsg pos
+           $ "Can't declare trait type " ++ show currMod
+             ++ " with constructors"
+      else if hasTrait
+      then errmsg pos
+           $ "Duplicated trait declarations for type " ++ show currMod
+      else do
+        setTrait
+        addKnownType currMod
+
+-- |Set the type representation of the current module.
+setTrait :: Compiler ()
+setTrait = do
+    updateModule (\m -> m { modIsType  = True
+                          , modTrait = Just () })
+
+
 -- |Add the specified data constructor to the current module.  This makes the
 -- module a type.  Also verify that all mentioned type variables are parameters
 -- of this type.
@@ -936,10 +993,14 @@ addConstructor vis pctor = do
     let ctor = content pctor
     currMod <- getModuleSpec
     hasRepn <- isJust <$> getModule modTypeRep
-    when hasRepn
-      $ errmsg pos
+    hasTrait <- isJust <$> getModule modTrait
+    if hasRepn
+      then errmsg pos
            $ "Declaring constructor for type " ++ showModSpec currMod
            ++ " with declared representation"
+      else when hasTrait $
+           errmsg pos
+           $ "Declaring constructor for trait type " ++ show currMod
     pctors <- fromMaybe [] <$> getModuleImplementationField modConstructors
     let redundant =
           any ((\c -> procProtoName c == procProtoName ctor
@@ -994,7 +1055,9 @@ lookupType context pos ty = do
 lookupType' :: String -> OptPos -> TypeSpec -> Compiler ([Message], TypeSpec)
 lookupType' _ _ AnyType = return ([], AnyType)
 lookupType' _ _ InvalidType = return ([], InvalidType)
-lookupType' _ _ ty@TypeVariable{} = return ([], ty)
+lookupType' context pos ty@TypeVariable{typeVariableBounds=bounds} = do
+    (msgs, bounds') <- mapAndUnzipM (lookupType' context pos) $ Set.toList bounds
+    return (concat msgs, ty{typeVariableBounds=Set.fromList bounds'})
 lookupType' _ _ ty@Representation{} = return ([], ty)
 lookupType' context pos ty@HigherOrderType{higherTypeParams=typeFlows} = do
     (msgs, types) <- mapAndUnzipM (lookupType' context pos . typeFlowType) typeFlows
@@ -1048,46 +1111,72 @@ typeIsUnique TypeSpec { typeMod = mod, typeName = name } = do
 typeIsUnique _ = return False
 
 
--- |Add the specified resource to the current module.
-addSimpleResource :: ResourceName -> ResourceImpln -> Visibility -> Compiler ()
-addSimpleResource name impln@(SimpleResource ty _ pos) vis = do
+-- |Add the specified resource and its definition to the current module.
+-- We first check if the named resource is already defined, and report an error
+-- if so.  Otherwise, providing the type is not generic, we record the
+-- definition to process once types have been checked.
+addResource :: ResourceName -> Visibility -> ResourceDefn -> OptPos
+            -> Compiler ()
+addResource name vis def pos = do
     currMod <- getModuleSpec
     let rspec = ResourceSpec currMod name
-    let rdef = Map.singleton rspec impln
     modRess <- getModuleImplementationField modResources
     if name `Map.member` modRess
     then errmsg pos $ "Duplicate declaration of resource '" ++ name ++ "'"
-    else if genericType ty
-    then errmsg pos $ "Resource type cannot contain type variables: " ++ show ty
-    else do
-        updateImplementation
-            (\imp -> imp { modResources = Map.insert name rdef $ modResources imp,
-                           modKnownResources = setMapInsert name rspec
-                                             $ modKnownResources imp })
-        updateInterface vis $ updatePubResources $ Map.insert name rspec
+    else case def of
+        SimpleResourceDefn ty init -> do
+            if genericType ty
+            then errmsg pos $ "Resource type cannot contain type variables: "
+                                ++ show ty
+            else do
+                let impln = PrimResource ty init pos
+                let rdef = Map.singleton rspec impln
+                updateImplementation
+                    (\imp -> imp { modResources = Map.insert name rdef
+                                                    $ modResources imp,
+                                modKnownResources = setMapInsert name rspec
+                                                    $ modKnownResources imp })
+                updateInterface vis $ updatePubResources $ Map.insert name rspec
+        CompoundResourceDefn ress -> do
+            let resSet = Set.fromList ress
+            updateImplementation
+                (\imp -> imp { modCompoundResources =
+                                    Map.insert name (resSet, pos)
+                                    $ modCompoundResources imp,
+                            modKnownResources = setMapInsert name rspec
+                                                $ modKnownResources imp })
+            updateInterface vis $ updatePubResources $ Map.insert name rspec
+
+
+-- |Fully qualify the given resource spec, if the resource has been defined.
+lookupResourceSpec :: ResourceSpec -> Compiler (Maybe ResourceSpec)
+lookupResourceSpec res@(ResourceSpec mod name) = do
+    logAST $ "qualifying resource spec " ++ show res
+    rspecs <- refersTo mod name modKnownResources resourceMod
+    logAST $ "Candidates: " ++ show rspecs
+    case Set.size rspecs of
+        0 | List.null mod && Map.member name specialResources -> return $ Just res
+        0 -> return Nothing
+        1 -> return $ Just $ Set.findMin rspecs
+        _ -> return Nothing
 
 
 -- |Find the definition of the specified resource visible in the current module.
 lookupResource :: ResourceSpec -> Compiler (Maybe ResourceDef)
-lookupResource res@(ResourceSpec mod name) = do
-    logAST $ "Looking up resource " ++ show res
-    rspecs <- refersTo mod name modKnownResources resourceMod
-    logAST $ "Candidates: " ++ show rspecs
-    case (Set.size rspecs, Map.lookup name specialResources) of
-        (0, Just (_,ty)) | List.null mod ->
-            return $ Just $ Map.singleton res
-                   $ SimpleResource ty Nothing Nothing
-        (0, _) -> return Nothing
-        (1,_) -> do
-            let rspec = Set.findMin rspecs
-            maybeMod <- getLoadingModule $ resourceMod rspec
+lookupResource res =
+    lookupResourceSpec res >>= \case
+        Nothing -> return Nothing
+        Just res'@(ResourceSpec [] name) -> do
+            let rdef t = Map.singleton res' (PrimResource t Nothing Nothing)
+            return $ rdef . snd <$> Map.lookup name specialResources
+        Just (ResourceSpec mod name) -> do
+            maybeMod <- getLoadingModule mod
             let maybeDef = maybeMod >>= modImplementation >>=
-                        Map.lookup (resourceName rspec) . modResources
+                        Map.lookup name . modResources
             logAST $ "Found resource:  " ++ show maybeDef
             let rdef = trustFromJust "lookupResource" maybeDef
             logAST $ "  with definition:  " ++ show rdef
             return $ Just rdef
-        _   -> return Nothing
 
 
 -- |All the "special" resources, which Wybe automatically generates where they
@@ -1278,10 +1367,25 @@ addProc tmpCtr (ProcDecl vis mods proto stmts pos) = do
     let name = procProtoName proto
     let ProcModifiers detism inlining impurity variant _ = mods
     let procDef = ProcDef name proto (ProcDefSrc stmts) pos tmpCtr 0 Map.empty
-                  vis detism inlining impurity variant (initSuperprocSpec vis) Map.empty
+                  vis Nothing detism inlining impurity variant (initSuperprocSpec vis) Map.empty [] 0
     void $ addProcDef procDef
 addProc _ item =
     shouldnt $ "addProc given non-Proc item " ++ show item
+
+
+-- |Add the specified abstract proc definition to the current module.
+addAbstractProc :: Int -> Item -> Compiler ()
+addAbstractProc tmpCtr (AbstractProcDecl mods proto stmts pos) = do
+    let name = procProtoName proto
+    let ProcModifiers detism inlining impurity variant _ = mods
+    abstractProcIndex <- getModule modAbstractProcCount
+    updateModule (\mod -> mod { modAbstractProcCount = abstractProcIndex + 1 })
+    let procDef = ProcDef name proto ProcDefAbstract pos tmpCtr 0 Map.empty
+                  Public (Just abstractProcIndex) detism inlining impurity variant (initSuperprocSpec Public)
+                  Map.empty [] 0
+    void $ addProcDef procDef
+addAbstractProc _ item =
+    shouldnt $ "addAbstractProc given non-AbstractProc item " ++ show item
 
 
 addProcDef :: ProcDef -> Compiler ProcSpec
@@ -1305,6 +1409,18 @@ addProcDef procDef = do
     logAST $ "Adding definition of " ++ show spec ++ ":" ++
       showProcDef 4 procDef
     return spec
+
+
+addTraitImpl :: OptPos -> TraitImplSpec -> Compiler ()
+addTraitImpl pos spec = do
+    knownTraitImpls <- getModuleImplementationField modKnownTraitImpls
+    case Map.lookup spec knownTraitImpls of
+        Just _ ->
+            warnmsg pos $
+                "Duplicate trait implementation declaration: " ++ show spec
+        _ -> updateImplementation (\imp -> imp {
+            modKnownTraitImpls = Map.insert spec (KnownTraitImpl Nothing pos) $
+                modKnownTraitImpls imp })
 
 
 getParams :: ProcSpec -> Compiler [Param]
@@ -1433,6 +1549,8 @@ data Module = Module {
   modIsType :: Bool,               -- ^Is this module a type, defined early
   modTypeRep :: Maybe TypeRepresentation, -- ^Type representation, when known
   modTypeSize :: Maybe Int,        -- ^The maximum size required to allocate an object of this type
+  modTrait :: Maybe (),            -- ^Is this module a trait;
+                                   --  The Maybe value is reserved for the trait dependency feature
   modInterface :: ModuleInterface, -- ^The public face of this module
   modInterfaceHash :: InterfaceHash,
                                    -- ^Hash of the "modInterface" above
@@ -1449,6 +1567,11 @@ data Module = Module {
   modStructCount :: Int,
                                    -- ^The number of structs defined in this
                                    -- module; used to generate unique names
+  modAbstractProcCount :: Int,
+                                   -- ^The number of abstract procs defined in
+                                   -- this module
+  modVTables :: Map TraitImplSpec (Int, StructID),
+                                   -- ^The vtables defined in this module
   stmtDecls :: [Placed Stmt],      -- ^top-level statements in this module
   itemsHash :: Maybe String        -- ^map of proc name to its hash
   } deriving (Generic)
@@ -1465,6 +1588,7 @@ emptyModule = Module
     , modIsType         = False
     , modTypeRep        = Nothing
     , modTypeSize       = Nothing
+    , modTrait          = Nothing
     , modInterface      = emptyInterface
     , modInterfaceHash  = Nothing
     , modImplementation = Just emptyImplementation
@@ -1472,6 +1596,8 @@ emptyModule = Module
     , modStructs        = Map.empty
     , modStructID       = Map.empty
     , modStructCount    = 0
+    , modAbstractProcCount = 0
+    , modVTables        = Map.empty
     , stmtDecls         = []
     , itemsHash         = Nothing
     }
@@ -1536,7 +1662,7 @@ lookupConstInfo (StructID mspec n _) = do
 -- The resulting Exp does not use a StringValue constructor.
 cStringExpr :: String -> Compiler Exp
 cStringExpr str = do
-    structID <- recordConstStruct (CStringInfo str) 
+    structID <- recordConstStruct (CStringInfo str)
                         (Just $ StringValue str CString)
     return $ Typed (ConstStruct structID) cStringType Nothing
 
@@ -1609,6 +1735,56 @@ callTargets modspec name = do
     return pspecs
 
 
+-- |Return the abstract procs defined in a trait module
+abstractProcs :: TraitSpec -> Compiler [(ProcSpec, ProcDef)]
+abstractProcs trait = do
+    let traitMod = trustFromJust "abstractProcSpecsForVTable" $ typeModule trait
+        procSpecWithDef (def, ident) =
+            (ProcSpec traitMod (procName def) ident generalVersion, def)
+    procsInTraitMod <- getModuleImplementationField (List.map procSpecWithDef
+            <$> concatMap (`zip` [0..]) . Map.elems . modProcs) `inModule` traitMod
+    return $ List.sortOn (procAbstract . snd)
+        (List.filter (isJust . procAbstract . snd) procsInTraitMod)
+
+
+-- |Specialize an abstract trait method prototype for a concrete vtable spec.
+traitImplProcProto :: TraitImplSpec -> ProcDef -> Compiler ProcProto
+traitImplProcProto ispec@(TraitImplSpec trait implTy) absProcDef = do
+    traitParams <- maybe (return []) (getModule modParams `inModule`) $
+        typeModule trait
+    let proto = procProto absProcDef
+        bounds = Map.fromListWith Set.union
+            [(name, Set.singleton bound) | (name, bound) <- procBoundedTypeParams absProcDef]
+        traitParamBindings = Map.fromList $ zip traitParams (typeParams trait)
+    return proto {
+        procProtoParams =
+            contentApply (substParam traitParamBindings bounds) <$>
+                procProtoParams proto
+    }
+  where
+    substParam traitParamBindings bounds param =
+        param { paramType =
+            substParamType traitParamBindings bounds $ paramType param }
+    substParamType traitParamBindings bounds ty@TypeVariable{typeVariableName=name}
+        | any sameTraitModule (Map.findWithDefault Set.empty name bounds) =
+            implTy
+        | otherwise =
+            fromMaybe ty {
+                typeVariableBounds =
+                    Set.map (substParamType traitParamBindings bounds)
+                        (typeVariableBounds ty)
+            } $ Map.lookup name traitParamBindings
+    substParamType traitParamBindings bounds ty@TypeSpec{typeParams=params} =
+        ty { typeParams = substParamType traitParamBindings bounds <$> params }
+    substParamType traitParamBindings bounds ty@HigherOrderType{higherTypeParams=tfs} =
+        ty { higherTypeParams = substTypeFlow traitParamBindings bounds <$> tfs }
+    substParamType _ _ ty = ty
+    substTypeFlow traitParamBindings bounds tf =
+        tf { typeFlowType =
+            substParamType traitParamBindings bounds $ typeFlowType tf }
+    sameTraitModule bound = typeModule bound == typeModule trait
+
+
 -- |Apply the given function to the current module implementation.
 updateModImplementation :: (ModuleImplementation -> ModuleImplementation) ->
                           Compiler ()
@@ -1652,6 +1828,8 @@ data ModuleInterface = ModuleInterface {
     pubProcs :: ProcDictionary,
                                      -- ^The procs this module exports
     pubSubmods   :: Map Ident ModSpec, -- ^The submodules this module exports
+    traitImpls :: Map TraitImplSpec ModSpec,
+                                     -- ^The defined and imported trait implementations
     dependencies :: Set ModSpec,      -- ^The other modules that must be linked
                                       --  in by modules that depend on this one
     typeModifiers :: TypeModifiers    -- ^The extra information of the type
@@ -1660,7 +1838,7 @@ data ModuleInterface = ModuleInterface {
 
 emptyInterface :: ModuleInterface
 emptyInterface =
-    ModuleInterface Map.empty Map.empty Map.empty Set.empty defaultTypeModifiers
+    ModuleInterface Map.empty Map.empty Map.empty Map.empty Set.empty defaultTypeModifiers
 
 
 -- |Holds information describing public procedures of a module.
@@ -1712,10 +1890,19 @@ data ModuleImplementation = ModuleImplementation {
                                               -- ^reversed list of data
                                               -- constructors for this
                                               -- type, if it is a type
+    modCompoundResources :: Map Ident (Set ResourceSpec,OptPos),
+                                              -- ^Defined compound resources 
     modKnownTypes:: Map Ident (Set ModSpec),  -- ^Types visible to this module
     modKnownResources :: Map Ident (Set ResourceSpec),
                                               -- ^Resources visible to this mod
     modKnownProcs:: Map Ident (Set ProcSpec), -- ^Procs visible to this module
+    modKnownTraitImpls :: Map TraitImplSpec KnownTraitImpl,
+                                              -- ^Trait impls visible to this mod
+    modTraitImplProcs :: Map TraitImplSpec [ProcSpec],
+                                              -- Original procs satisfying impls
+    modVTableProcs :: Map TraitImplSpec [ProcSpec],
+                                              -- Final procs stored in vtables,
+                                              -- including generated adapters
     modForeignObjects:: Set FilePath,         -- ^Foreign object files used
     modForeignLibs:: Set String               -- ^Foreign libraries used
     } deriving (Generic)
@@ -1724,7 +1911,7 @@ emptyImplementation :: ModuleImplementation
 emptyImplementation =
     ModuleImplementation Set.empty Map.empty Nothing Map.empty Map.empty
                          Map.empty Nothing Map.empty Map.empty Map.empty
-                         Set.empty Set.empty -- Nothing
+                         Map.empty Map.empty Map.empty Map.empty Set.empty Set.empty -- Nothing
 
 
 -- These functions hack around Haskell's terrible setter syntax
@@ -1856,6 +2043,15 @@ data ImportSpec = ImportSpec {
     } deriving (Show, Generic)
 
 
+-- |Indicate whether the import takes place after complete normalisation. 
+-- This is primarily used for importing trait implementations, which are only
+-- available after complete normalisation.
+data ImportPhase =
+    BeforeCompleteNormalisation
+  | AfterCompleteNormalisation
+  deriving (Eq, Show)
+
+
 -- |Create an import spec to import the identifiers specified by the
 --  first argument (or everything public if it is Nothing), either
 --  publicly or privately, as specified by the second argument.
@@ -1882,8 +2078,8 @@ combineImportSpecs (ImportSpec pub1 priv1) (ImportSpec pub2 priv2) =
 -- have been loaded and their imports have been handled.  The case of
 -- mutual dependencies is handled by repeating this until a fixed point
 -- is reached.
-doImport :: ModSpec -> (ImportSpec, InterfaceHash) -> Compiler ()
-doImport mod (imports, _) = do
+doImport :: ImportPhase -> ModSpec -> (ImportSpec, InterfaceHash) -> Compiler ()
+doImport phase mod (imports, _) = do
     currMod <- getModuleSpec
     impl <- getModuleImplementationField id
     logAST $ "Handle importation from " ++ showModSpec mod ++
@@ -1901,6 +2097,11 @@ doImport mod (imports, _) = do
     let importedResources = importsSelected allImports $ pubResources fromIFace
     let importedProcs = Map.map Map.keysSet
                             $ importsSelected allImports $ pubProcs fromIFace
+    let importedTraitImpls
+          | phase == AfterCompleteNormalisation =
+              Map.map (\owner -> KnownTraitImpl (Just owner) Nothing)
+              $ traitImpls fromIFace
+          | otherwise = Map.empty
     logAST $ "    importing types    : "
              ++ showModSpecs (snd <$> importedTypesAssoc)
     logAST $ "    importing resources: "
@@ -1915,10 +2116,12 @@ doImport mod (imports, _) = do
             Map.unionWith Set.union (modKnownResources impl) $
             Map.map Set.singleton importedResources
     let knownProcs = Map.unionWith Set.union (modKnownProcs impl) importedProcs
+    let knownTraitImpls = Map.union (modKnownTraitImpls impl) importedTraitImpls
     -- Update what's visible in the module
     updateModImplementation (\imp -> imp { modKnownTypes = knownTypes,
                                            modKnownResources = knownResources,
-                                           modKnownProcs = knownProcs })
+                                           modKnownProcs = knownProcs,
+                                           modKnownTraitImpls = knownTraitImpls })
     logAST $ "New exports from module " ++ showModSpec mod ++ ":"
     let exportedMods = importsSelected pubImports
                        $ Map.insert (last mod) mod $ pubSubmods fromIFace
@@ -1935,23 +2138,43 @@ doImport mod (imports, _) = do
     return ()
 
 
--- |Import known types, resources, and procs from the specified module into the
--- current one.  This is used to give a nested submodule access to its parent's
--- members.  It's also used to give the executable module access to the main
--- module of the application.
-importFromSupermodule :: ModSpec -> Compiler ()
-importFromSupermodule modspec = do
+-- |Import known types, resources, procs, and, after trait impl
+-- normalisation, trait impls from the specified module into the current one.
+-- This is used to give a nested submodule access to its parent's members.
+-- It's also used to give the executable module access to the main module of
+-- the application.
+importFromSupermodule :: ImportPhase -> ModSpec -> Compiler ()
+importFromSupermodule phase modspec = do
     impl       <- getLoadedModuleImpln modspec
     kTypes     <- getModuleImplementationField modKnownTypes
     kResources <- getModuleImplementationField modKnownResources
     kProcs     <- getModuleImplementationField modKnownProcs
+    kTraitImpls <- getModuleImplementationField modKnownTraitImpls
     let knownTypes = Map.unionWith Set.union (modKnownTypes impl) kTypes
     let knownResources =
             Map.unionWith Set.union (modKnownResources impl) kResources
     let knownProcs = Map.unionWith Set.union (modKnownProcs impl) kProcs
+    let importedTraitImpls = Map.map
+            (\timpl -> timpl{ traitImplMod =
+                Just $ traitImplModule modspec timpl })
+            (modKnownTraitImpls impl)
+        knownTraitImpls
+          | phase == AfterCompleteNormalisation =
+              Map.union kTraitImpls importedTraitImpls
+          | otherwise = kTraitImpls
     updateModImplementation (\imp -> imp { modKnownTypes = knownTypes,
                                            modKnownResources = knownResources,
-                                           modKnownProcs = knownProcs })
+                                           modKnownProcs = knownProcs,
+                                           modKnownTraitImpls = knownTraitImpls })
+
+
+-- |Publish the currently visible trait implementations in the module interface.
+publishTraitImpls :: Compiler ()
+publishTraitImpls = do
+    thisMod <- getModuleSpec
+    knownTraitImpls <- getModuleImplementationField modKnownTraitImpls
+    let traitImpls = Map.map (traitImplModule thisMod) knownTraitImpls
+    updateModInterface (\int -> int{ traitImpls=traitImpls })
 
 
 -- | Resolve a (possibly) relative module spec into an absolute one.  The
@@ -2028,17 +2251,20 @@ resourceDefToIFace = Map.map resourceType
 
 -- |A resource definition.  Since a resource may be defined as a
 --  collection of other resources, this is a set of resources (for
---  simple resources, this will be a singleton), each with type and
---  possibly an initial value.  There's also an optional source
--- position.
-type ResourceDef = Map ResourceSpec ResourceImpln
+--  simple resources, this will be a singleton), each with type,
+--  possibly an initial value, and an optional source position.
+type ResourceDef = Map ResourceSpec PrimResourceImpln
 
-data ResourceImpln =
-    SimpleResource {
+
+-- | A single primitive (simple) resource implementation.  A compound resource
+-- may be implemented in terms of multiple simple resources.
+data PrimResourceImpln =
+    PrimResource {
         resourceType::TypeSpec,
         resourceInit::Maybe (Placed Exp),
         resourcePos::OptPos
-        } deriving (Generic, Eq)
+        }
+    deriving (Generic, Eq)
 
 
 -- | Return the initialised resources *defined* by the current module.
@@ -2083,17 +2309,23 @@ data ProcDef = ProcDef {
                                 -- add up the call counts, so we might as well
                                 -- keep just a count
     procVis :: Visibility,      -- ^what modules should be able to see this?
+    procAbstract :: Maybe Int,  -- ^is this proc abstract? and its index in vtable
     procDetism :: Determinism,  -- ^can this proc fail?
     procInlining :: Inlining,   -- ^should we inline calls to this proc?
     procImpurity :: Impurity,   -- ^ Is this proc pure?
     procVariant :: ProcVariant, -- ^ How is this proc manifested in the source code
     procSuperproc :: SuperprocSpec,
                                 -- ^the proc this should be part of, if any
-    procVariableFlows :: Map PrimVarName GlobalFlows
+    procVariableFlows :: Map PrimVarName GlobalFlows,
                                 -- ^ The currently known global flows of each
                                 -- variable in this proc. If a variable is not
                                 -- contained in the map, the flows are not
                                 -- known, and can be assumed to be universal
+    procBoundedTypeParams :: [TypeVarBound],
+                                -- ^The bounded type variables in the proc's params
+                                -- used for generating vtable params
+    procFauxTypeVarCount :: Int
+                                -- ^The number of faux type variables
 }
              deriving (Eq, Generic)
 
@@ -2120,6 +2352,7 @@ procBody :: ProcDef -> Maybe ProcBody
 procBody def =
     case procImpln def of
         ProcDefSrc{}                     -> Nothing
+        ProcDefAbstract                  -> Nothing
         ProcDefPrim{procImplnBody=body}  -> Just body
 
 
@@ -2130,6 +2363,7 @@ allProcBodies :: ProcDef -> [ProcBody]
 allProcBodies def =
     case procImpln def of
         ProcDefSrc{}                     -> []
+        ProcDefAbstract                  -> []
         ProcDefPrim{procImplnBody=body, procImplnSpeczBodies=specz} ->
              body : catMaybes (Map.elems specz)
 
@@ -2145,7 +2379,8 @@ getProcGlobalFlows :: ProcSpec -> Compiler GlobalFlows
 getProcGlobalFlows pspec = do
     pDef <- getProcDef pspec
     case procImpln pDef of
-      ProcDefSrc _ ->
+      ProcDefPrim _ (PrimProto _ _ gFlows) _ _ _ -> return gFlows
+      _ ->
             let ProcProto _ params resFlows = procProto pDef
                 paramFlows
                     | any (isResourcefulHigherOrder . paramType . content) params
@@ -2153,7 +2388,6 @@ getProcGlobalFlows pspec = do
                     | otherwise
                     = emptyUnivSet
             in return $ (makeGlobalFlows [] resFlows){globalFlowsParams=paramFlows}
-      ProcDefPrim _ (PrimProto _ _ gFlows) _ _ _ -> return gFlows
 
 
 -- | How many static calls to this proc from the same module have we seen?  This
@@ -2174,8 +2408,11 @@ primImpurity (PrimHigher _ (ArgConstRef structID _) impurity _) = do
     lookupConstInfo structID >>= \case
         Just (StructInfo _ (FnPointerStructMember pspec:t)) ->
             max impurity . procImpurity <$> getProcDef pspec
+        Just (VTableInfo _ (FnPointerStructMember pspec:t) _ _ _ _ _) ->
+            max impurity . procImpurity <$> getProcDef pspec
         _ -> return impurity
 primImpurity (PrimHigher _ fn impurity _) = return impurity
+primImpurity (PrimVirtualCall _ table index impurity _ _) = return impurity
 primImpurity (PrimForeign _ _ flags _)
     = return $ flagsImpurity flags
 
@@ -2216,6 +2453,7 @@ data ProcVariant
     | GeneratedProc
     | AnonymousProc
     | ClosureProc ProcSpec Bool
+    | AdapterProc
     deriving (Eq, Ord, Show, Generic)
 
 
@@ -2268,6 +2506,7 @@ isConstructorVariant _                   = False
 -- Finally it is turned into SSA form (LLVM).
 data ProcImpln
     = ProcDefSrc [Placed Stmt]           -- ^defn in AST (source-like) form
+    | ProcDefAbstract                    -- ^no body defined (abstract proc)
     | ProcDefPrim {
         procImplnProcSpec :: ProcSpec,
         procImplnProto :: PrimProto,
@@ -2286,7 +2525,7 @@ data GlobalFlows
         globalFlowsOut :: UnivSet GlobalInfo,
         -- ^ The set of globals that flow out
         globalFlowsParams :: UnivSet ParameterID
-        -- ^ The set of parameters (by ID) that effect the global flwos
+        -- ^ The set of parameters (by ID) that effect the global flows
     }
     deriving (Eq, Ord, Generic)
 
@@ -2508,12 +2747,18 @@ emptyProcAnalysis :: ProcAnalysis
 emptyProcAnalysis = ProcAnalysis emptyDS Set.empty Map.empty
 
 
+-- |Check if a procedure definition body is compiled. 
+-- Although an abstract procedure doesn't have a body, it is compiled to
+-- a virtual call through the vtable
 isCompiled :: ProcImpln -> Bool
 isCompiled ProcDefPrim {} = True
-isCompiled (ProcDefSrc _) = False
+isCompiled ProcDefSrc{} = False
+isCompiled ProcDefAbstract{} = False
+
 
 instance Show ProcImpln where
     show (ProcDefSrc stmts) = showBody 4 stmts
+    show ProcDefAbstract = show "(abstract proc)"
     show (ProcDefPrim pSpec proto body analysis speczVersions) =
         let speczBodies = Map.toList speczVersions
                 |> List.map (\(ver, body) ->
@@ -2580,7 +2825,7 @@ data PrimFork =
       forkVar::PrimVarName,       -- ^The variable that selects branch to take
       forkVarType::TypeSpec,      -- ^The Wybe type of the forkVar
       forkVarLast::Bool,          -- ^Is this the last occurrence of forkVar
-      forkBodies::[(Integer,ProcBody)],   
+      forkBodies::[(Integer,ProcBody)],
                                   -- ^one branch for each value of forkVar
       forkDefault::Maybe ProcBody -- ^branch to take if forkVar is out of range
     } |
@@ -2619,10 +2864,10 @@ prependToBody before (ProcBody prims fork)
 unMergeFork :: PrimFork -> Compiler PrimFork
 unMergeFork (MergedFork var ty final table body dlft) = do
     table' <- mapM (\(var, ty, id, _) -> (var, ty,) . List.map (`constValuePrimArg` ty) . arrayData . trustFromJust "unMergeFork" <$> lookupConstInfo id) table
-    let untabled = List.transpose 
-                    $ List.map (\(var', ty', vals) -> List.map (\p -> Unplaced $ PrimForeign "llvm" "move" [] [p, ArgVar var' ty' FlowOut Ordinary False]) vals) 
+    let untabled = List.transpose
+                    $ List.map (\(var', ty', vals) -> List.map (\p -> Unplaced $ PrimForeign "llvm" "move" [] [p, ArgVar var' ty' FlowOut Ordinary False]) vals)
                     table'
-    return $ if List.null untabled 
+    return $ if List.null untabled
     then NoFork
     else PrimFork var ty final (zip [0..] (List.map (`prependToBody` body) untabled)) dlft
 unMergeFork fork = shouldnt $ "unMergeFork on non-merged " ++ show fork
@@ -2631,7 +2876,7 @@ unMergeFork fork = shouldnt $ "unMergeFork on non-merged " ++ show fork
 -- with the given var used int the fork
 guardedMergedFork :: PrimVarName -> PrimVarName -> TypeSpec -> Integer -> ProcBody -> Maybe ProcBody -> ProcBody
 guardedMergedFork _   _   _  _     body Nothing     = body
-guardedMergedFork tmp var ty limit body (Just dflt) = 
+guardedMergedFork tmp var ty limit body (Just dflt) =
     ProcBody
         [Unplaced $ PrimForeign "llvm" "icmp_ule" []
           [ArgVar var ty FlowIn Ordinary False, ArgInt limit ty, ArgVar tmp bit FlowOut Ordinary False]]
@@ -2830,8 +3075,8 @@ foldBodyDistrib primFn emptyConj abDisj abConj (ProcBody pprims fork) =
         foldAll (foldBodyDistrib primFn common abDisj abConj $ snd body) $ List.map snd bodies ++ maybeToList deflt
       MergedFork{forkBody=body, forkDefault=deflt} ->
         foldAll (foldBodyDistrib primFn common abDisj abConj body) $ maybeToList deflt
-            
-            
+
+
 
 
 -- |Traverse a ProcBody applying a monadic primFn to every Prim and applying a
@@ -2860,6 +3105,9 @@ mapSinglePrimM primFn argFn prim = do
         PrimCall _ _ _ args _  -> mapM_ (mapSinglePrimArgM primFn argFn) args
         PrimHigher _ fn _ args -> do
             mapSinglePrimArgM primFn argFn fn
+            mapM_ (mapSinglePrimArgM primFn argFn) args
+        PrimVirtualCall _ table _ _ args _ -> do
+            mapSinglePrimArgM primFn argFn table
             mapM_ (mapSinglePrimArgM primFn argFn) args
 
 
@@ -2907,7 +3155,10 @@ data TypeSpec = TypeSpec {
         higherTypeModifiers::ProcModifiers,
         higherTypeParams::[TypeFlow]
     }
-    | TypeVariable { typeVariableName :: TypeVarName }
+    | TypeVariable {
+        typeVariableName :: TypeVarName,
+        typeVariableBounds :: Set TraitSpec
+    }
     | Representation { typeSpecRepresentation :: TypeRepresentation }
     -- the top or bottom of the type lattice, respectively
     | AnyType | InvalidType
@@ -2919,7 +3170,7 @@ typeVarSet TypeSpec{typeParams=params}
     = List.foldr (Set.union . typeVarSet) Set.empty params
 typeVarSet HigherOrderType{higherTypeParams=params}
     = List.foldr ((Set.union . typeVarSet) . typeFlowType) Set.empty params
-typeVarSet (TypeVariable v) = Set.singleton v
+typeVarSet (TypeVariable v _) = Set.singleton v
 typeVarSet Representation{} = Set.empty
 typeVarSet AnyType = Set.empty
 typeVarSet InvalidType = Set.empty
@@ -2960,6 +3211,87 @@ isResourcefulHigherOrder (TypeSpec _ _ tys) =
 isResourcefulHigherOrder _ = False
 
 
+-- |Return true if the given type spec is a trait type
+isTraitType :: TypeSpec -> Compiler Bool
+isTraitType typ =
+    case typeModule typ of
+        Just mod -> do
+            trait <- getModule modTrait `inModule` mod
+            return $ isJust trait
+        Nothing -> return False
+
+
+-- |The type variables introduced for trait types used as types, and the
+-- number of the next faux type variable to introduce.
+data TraitTypeVars = TraitTypeVars {
+    traitTypeVarDict :: Map TraitSpec TypeSpec,
+                            -- ^ Generated type variables that look like
+                            -- `Type0<:comparable` for trait types like
+                            -- `comparable`.
+    traitTypeVarCounter :: Int
+                            -- ^ For numbering type variables.
+}
+
+
+-- |Replace each trait type within a type with a type variable bounded by that
+-- trait, so `comparable` means `T<:comparable`.  Type arguments are replaced
+-- before the type containing them.  Every occurrence of the same trait,
+-- across all types converted with the same state, shares one type variable.
+traitTypesToTypeVars :: TypeSpec -> StateT TraitTypeVars Compiler TypeSpec
+traitTypesToTypeVars ty@TypeSpec{typeParams=params} = do
+    params' <- mapM traitTypesToTypeVars params
+    let ty' = ty { typeParams = params' }
+    isTrait <- lift $ isTraitType ty'
+    if not isTrait then return ty' else do
+        dict <- gets traitTypeVarDict
+        case Map.lookup ty' dict of
+            Just var -> return var
+            Nothing -> do
+                next <- gets traitTypeVarCounter
+                let var = TypeVariable (FauxTypeVar next) (Set.singleton ty')
+                put $ TraitTypeVars (Map.insert ty' var dict) (next + 1)
+                return var
+traitTypesToTypeVars ty@HigherOrderType{higherTypeParams=flows} = do
+    tys <- mapM (traitTypesToTypeVars . typeFlowType) flows
+    return ty { higherTypeParams = zipWith setTypeFlowType tys flows }
+traitTypesToTypeVars ty = return ty
+
+
+-- |Report every trait bound within a type declared in a context that does not
+-- allow them, such as "a constructor parameter", and return the type with
+-- those bounds removed.  A trait used as a type is replaced by InvalidType, so
+-- later passes do not report further errors for it.
+rejectTraitBounds :: String -> OptPos -> TypeSpec -> Compiler TypeSpec
+rejectTraitBounds context pos ty@TypeSpec{typeParams=params} = do
+    isTrait <- isTraitType ty
+    if isTrait
+        then do
+            errmsg pos $ traitBoundNotAllowedMsg
+                ("Trait type " ++ show ty) context
+            return InvalidType
+        else do
+            params' <- mapM (rejectTraitBounds context pos) params
+            return ty { typeParams = params' }
+rejectTraitBounds context pos ty@TypeVariable{typeVariableBounds=bounds}
+    | Set.null bounds = return ty
+    | otherwise = do
+        errmsg pos $ traitBoundNotAllowedMsg ("Trait bound " ++ show ty) context
+        return ty { typeVariableBounds = Set.empty }
+rejectTraitBounds context pos ty@HigherOrderType{higherTypeParams=flows} = do
+    tys <- mapM (rejectTraitBounds context pos . typeFlowType) flows
+    return ty { higherTypeParams = zipWith setTypeFlowType tys flows }
+rejectTraitBounds _ _ ty = return ty
+
+
+-- |The message for a trait bound, described by the first argument, written
+-- in a context that does not allow them, such as "a constructor parameter".
+traitBoundNotAllowedMsg :: String -> String -> String
+traitBoundNotAllowedMsg what context =
+    what ++ " is not allowed in " ++ context
+    ++ "; trait bounds are only allowed in procedure and function parameter "
+    ++ "types and trait implementation types"
+
+
 -- | Return the module of the specified type, if it has one.
 typeModule :: TypeSpec -> Maybe ModSpec
 typeModule (TypeSpec mod name _) = Just $ mod ++ [name]
@@ -2973,6 +3305,10 @@ typeModule InvalidType           = Nothing
 -- |This type keeps track of the types of source variables.
 type VarDict = Map VarName TypeSpec
 
+-- |This type keeps track of the bindings and trait bounds of type variables.
+-- A type variable is either bound to a concrete type or constrained by a set
+-- of traits.
+type TypeVarDict = Map TypeVarName (Either TypeSpec (Set TraitSpec))
 
 data ResourceSpec = ResourceSpec {
     resourceMod::ModSpec,
@@ -3336,6 +3672,7 @@ data StringVariant = WybeString | CString
 -- constant list.
 data GlobalInfo = GlobalResource { globalResourceSpec :: ResourceSpec }
                 | GlobalVariable { globalVarSpec :: Ident }
+                | GlobalVTable { globalTraitImplSpec :: TraitImplSpec }
     deriving (Eq, Ord, Generic)
 
 
@@ -3360,6 +3697,7 @@ flattenedExpFlow (Var _ flow _)        = flow
 flattenedExpFlow (AnonParamVar _ flow) = flow
 flattenedExpFlow FailExpr              = ParamIn
 flattenedExpFlow (Typed exp _ _)       = flattenedExpFlow exp
+flattenedExpFlow (Global _)            = ParamIn
 flattenedExpFlow otherExp =
     shouldnt $ "Getting flow direction of unflattened exp " ++ show otherExp
 
@@ -3426,6 +3764,13 @@ typeIsPhantom ty = do
     logAST $ "Type " ++ show ty ++ " is "
              ++ (if result then "" else "NOT ") ++ "phantom"
     return result
+
+
+-- | Test if a type needs to be boxed when carrying a large concrete value.
+typeNeedsBoxing :: TypeSpec -> Bool
+typeNeedsBoxing AnyType        = True
+typeNeedsBoxing TypeVariable{} = True
+typeNeedsBoxing _              = False
 
 
 -- |Is the specified type representation a phantom type?
@@ -3504,6 +3849,7 @@ data PrimVarName =
 data Prim
      = PrimCall CallSiteID ProcSpec Impurity [PrimArg] GlobalFlows
      | PrimHigher CallSiteID PrimArg Impurity [PrimArg]
+     | PrimVirtualCall CallSiteID PrimArg Int Impurity [PrimArg] GlobalFlows
      | PrimForeign Ident ProcName [Ident] [PrimArg]
      deriving (Eq,Ord,Generic)
 
@@ -3536,6 +3882,423 @@ data PrimArg
      deriving (Eq,Ord,Generic)
 
 
+-- |A trait type specification.
+type TraitSpec = TypeSpec
+
+-- |Identifies an implementation of a trait for a type.
+data TraitImplSpec =
+    TraitImplSpec {
+        implTrait :: TraitSpec,                -- ^The implmentation trait spec
+        implType  :: TypeSpec                  -- ^The implmentation type spec
+    }
+    deriving (Eq,Ord,Generic)
+
+
+-- |A trait implementation known to a module.
+data KnownTraitImpl =
+    KnownTraitImpl {
+        traitImplMod :: Maybe ModSpec,
+            -- ^'Nothing' if the implementation is declared in the current
+            -- module, otherwise the module that provides it
+        traitImplPos :: OptPos
+            -- ^Where the implementation was declared
+    }
+    deriving (Eq,Ord,Generic)
+
+-- |The module providing the given trait implementation, defaulting to the
+-- given module for a locally declared implementation.
+traitImplModule :: ModSpec -> KnownTraitImpl -> ModSpec
+traitImplModule thisMod = fromMaybe thisMod . traitImplMod
+
+
+
+-- |The result of selecting a trait implementation. Ambiguity records both the
+-- requirement whose selection failed and its undominated matching declarations.
+data TraitImplResolution a
+    = TraitImplNotFound
+        -- ^No declaration matches structurally with satisfiable constraints.
+    | TraitImplResolved TraitImplSpec a
+        -- ^The uniquely most-specific declaration and its associated value.
+    | TraitImplAmbiguous TraitImplSpec [TraitImplSpec]
+        -- ^The concrete requirement and its canonically ordered, undominated
+        -- matching declarations.
+
+
+-- |The applicability of one structurally matching declaration while resolving
+-- its constraints. Ambiguous candidates remain relevant to specificity until
+-- a known applicable candidate is proved to dominate them.
+data CandidateStatus a
+    = CandidateApplicable (TraitImplSpec, a)
+        -- ^All constraints resolve uniquely, so the candidate can be ranked.
+    | CandidateInapplicable
+        -- ^At least one required bound has no implementation.
+    | CandidateAmbiguous (TraitImplSpec, a) (TraitImplSpec, [TraitImplSpec])
+        -- ^The candidate and the nested requirement whose constraints have
+        -- multiple undominated implementations.
+
+
+-- |Select the unique most-specific applicable implementation. Candidate
+-- constraints are resolved recursively; incomparable undominated candidates
+-- remain ambiguous rather than being ordered by their map or source order.
+resolveTraitImpl :: TraitImplSpec -> Map TraitImplSpec a
+                 -> TraitImplResolution a
+resolveTraitImpl requested impls = go Set.empty requested
+  where
+    go seen req
+        | req `Set.member` seen = TraitImplNotFound
+        | otherwise =
+            let seen' = Set.insert req seen
+                candidates =
+                    [ candidateStatus seen' req candidate
+                    | candidate <- Map.toAscList impls
+                    , isJust $ traitImplBindings (fst candidate) req
+                    ]
+                applicable = [candidate | CandidateApplicable candidate <- candidates]
+                ambiguous =
+                    [ (candidate, ambiguity)
+                    | CandidateAmbiguous candidate ambiguity <- candidates
+                    , not $ any
+                        (\(other, _) -> traitImplMoreSpecific other $ fst candidate)
+                        applicable
+                    ]
+            in case ambiguous of
+                (_, (ambiguousReq, ambiguousSpecs)):_ ->
+                    TraitImplAmbiguous ambiguousReq ambiguousSpecs
+                [] -> select req applicable
+    candidateStatus seen req candidate@(declared, _) =
+        case firstUnresolved seen $ traitImplConstraints declared req of
+            Nothing -> CandidateApplicable candidate
+            Just TraitImplNotFound -> CandidateInapplicable
+            Just (TraitImplAmbiguous ambiguousReq ambiguousSpecs) ->
+                CandidateAmbiguous candidate (ambiguousReq, ambiguousSpecs)
+            Just TraitImplResolved{} ->
+                shouldnt "candidateStatus: resolved constraints reported unresolved"
+    firstUnresolved _ [] = Nothing
+    firstUnresolved seen (constraint:rest)
+        | constraintGuaranteed constraint = firstUnresolved seen rest
+        | otherwise = case go seen constraint of
+            TraitImplResolved{} -> firstUnresolved seen rest
+            unresolved -> Just unresolved
+    constraintGuaranteed (TraitImplSpec bound TypeVariable{
+            typeVariableBounds=bounds}) = any (sameTraitConstraint bound) bounds
+    constraintGuaranteed _ = False
+    select req candidates = case undominated candidates of
+        [] -> TraitImplNotFound
+        [(declared, value)] -> TraitImplResolved declared value
+        ties@((first, _):_) -> TraitImplAmbiguous
+            (fromMaybe req $ specialiseTraitImpl first $ implType req)
+            (fst <$> ties)
+    undominated candidates =
+        [ candidate
+        | candidate@(declared, _) <- candidates
+        , not $ any
+            (\(other, _) -> traitImplMoreSpecific other declared) candidates
+        ]
+
+-- |Look up a uniquely selected trait implementation. Absence and ambiguity
+-- both return Nothing; callers that must diagnose the distinction use
+-- 'resolveTraitImpl'.
+lookupTraitImpl :: TraitImplSpec -> Map TraitImplSpec a
+                -> Maybe (TraitImplSpec, a)
+lookupTraitImpl requested impls = case resolveTraitImpl requested impls of
+    TraitImplResolved declared value -> Just (declared, value)
+    _ -> Nothing
+
+
+-- |Whether the first implementation declaration is strictly more specific
+-- than the second. Structural specialization and stronger variable bounds
+-- both contribute to specificity.
+traitImplMoreSpecific :: TraitImplSpec -> TraitImplSpec -> Bool
+traitImplMoreSpecific specific general =
+    traitImplSubsumes general specific
+        && not (traitImplSubsumes specific general)
+
+
+-- |Whether every type described by the specific declaration is also
+-- described by the general declaration. Concrete patterns may satisfy a
+-- bounded general variable because applicability is checked before ranking.
+traitImplSubsumes :: TraitImplSpec -> TraitImplSpec -> Bool
+traitImplSubsumes general specific =
+    typePatternsMoreGeneral Map.empty Map.empty (const $ const True)
+        [implType general, implTrait general]
+        [implType specific, implTrait specific]
+
+
+-- |Whether each general type pattern accepts every type accepted by the
+-- corresponding specific pattern. Bindings are shared across the pattern
+-- lists, and the supplied predicate handles a bound mapped to a concrete type.
+typePatternsMoreGeneral :: TypeVarDict -> TypeVarDict
+                        -> (TraitSpec -> TypeSpec -> Bool)
+                        -> [TypeSpec] -> [TypeSpec] -> Bool
+typePatternsMoreGeneral generalDict specificDict satisfiesBound
+        generalPatterns specificPatterns =
+    sameLength generalPatterns specificPatterns
+    && case foldM (uncurry . bindTypeVarsWith SubsumptionMatch) Map.empty $
+                zip generalPatterns specificPatterns of
+        Nothing -> False
+        Just bindings -> all (all (boundGuaranteed bindings) . (\(name, bounds) -> (name,)
+            <$> Set.toList bounds)) (Map.toList $ patternBounds generalDict generalPatterns)
+  where
+    specificBounds = patternBounds specificDict specificPatterns
+    boundGuaranteed bindings (name, bound) =
+        case Map.lookup name bindings of
+            Just TypeVariable{typeVariableName=specificName} ->
+                any (sameTraitConstraint specialisedBound) $ Map.findWithDefault Set.empty specificName
+                        specificBounds
+            Just concrete -> satisfiesBound specialisedBound concrete
+            Nothing -> False
+      where
+        specialisedBound = substituteTypeVars bindings bound
+
+
+-- |Collect and merge bounds from all occurrences of variables in patterns.
+patternBounds :: TypeVarDict -> [TypeSpec]
+              -> Map TypeVarName (Set TraitSpec)
+patternBounds dict = List.foldl' (Map.unionWith Set.union) Map.empty
+    . List.map boundsIn
+  where
+    boundsIn ty@TypeVariable{typeVariableName=name} =
+        Map.singleton name $ typeVarBoundsIn dict ty
+    boundsIn TypeSpec{typeParams=params} =
+        List.foldl' (Map.unionWith Set.union) Map.empty $ boundsIn <$> params
+    boundsIn HigherOrderType{higherTypeParams=flows} =
+        List.foldl' (Map.unionWith Set.union) Map.empty $
+            boundsIn . typeFlowType <$> flows
+    boundsIn _ = Map.empty
+
+
+data TypePatternMatch = RequestMatch | SubsumptionMatch
+
+
+-- |Match a type pattern using request-selection or pattern-subsumption
+-- semantics for repeated variables.
+bindTypeVarsWith :: TypePatternMatch -> Map TypeVarName TypeSpec
+                 -> TypeSpec -> TypeSpec -> Maybe (Map TypeVarName TypeSpec)
+bindTypeVarsWith mode bindings TypeVariable{typeVariableName=name} requested =
+    case Map.lookup name bindings of
+        Nothing -> Just $ Map.insert name requested bindings
+        Just previous
+            | repeatedVariableMatches mode previous requested -> Just bindings
+            | otherwise -> Nothing
+bindTypeVarsWith SubsumptionMatch bindings AnyType _ = Just bindings
+bindTypeVarsWith mode bindings (TypeSpec dmod dname dparams)
+                                (TypeSpec rmod rname rparams)
+    | dmod == rmod && dname == rname && sameLength dparams rparams =
+        foldM (uncurry . bindTypeVarsWith mode) bindings $
+            zip dparams rparams
+bindTypeVarsWith mode bindings (HigherOrderType dmods dparams)
+                                (HigherOrderType rmods rparams)
+    | dmods == rmods && sameLength dparams rparams =
+        foldM matchFlow bindings $ zip dparams rparams
+  where
+    matchFlow current (TypeFlow dty dflow, TypeFlow rty rflow)
+        | dflow == rflow = bindTypeVarsWith mode current dty rty
+        | otherwise = Nothing
+bindTypeVarsWith _ bindings declared requested
+    | declared == requested = Just bindings
+    | otherwise = Nothing
+
+
+repeatedVariableMatches :: TypePatternMatch -> TypeSpec -> TypeSpec -> Bool
+repeatedVariableMatches RequestMatch previous requested =
+    previous == requested || case requested of
+        TypeVariable{} -> True
+        _ -> False
+repeatedVariableMatches SubsumptionMatch previous requested =
+    sameTypePattern previous requested
+
+
+-- |Compare canonical patterns without forgetting variable identity. Bounds on
+-- the variable occurrences themselves do not participate.
+sameTypePattern :: TypeSpec -> TypeSpec -> Bool
+sameTypePattern TypeVariable{typeVariableName=left}
+                TypeVariable{typeVariableName=right} = left == right
+sameTypePattern (TypeSpec lmod lname lparams)
+                (TypeSpec rmod rname rparams) =
+    lmod == rmod && lname == rname && sameLength lparams rparams
+        && and (zipWith sameTypePattern lparams rparams)
+sameTypePattern (HigherOrderType lmods lparams)
+                (HigherOrderType rmods rparams) =
+    lmods == rmods && sameLength lparams rparams
+        && and (zipWith sameFlowPattern lparams rparams)
+  where
+    sameFlowPattern (TypeFlow lty lflow) (TypeFlow rty rflow) =
+        lflow == rflow && sameTypePattern lty rty
+sameTypePattern left right = left == right
+
+
+-- |Match a possibly-generic trait implementation declaration against a
+-- requested implementation, returning its type-variable bindings.
+traitImplBindings :: TraitImplSpec -> TraitImplSpec
+                  -> Maybe (Map TypeVarName TypeSpec)
+traitImplBindings declared requested = do
+    bindings <- bindTypeVars Map.empty
+        (implType declared) (implType requested)
+    bindTypeVars bindings (implTrait declared) (implTrait requested)
+
+
+-- |Match a possibly-generic declared type against a requested type, extending
+-- the supplied type-variable bindings.
+bindTypeVars :: Map TypeVarName TypeSpec -> TypeSpec -> TypeSpec
+                 -> Maybe (Map TypeVarName TypeSpec)
+bindTypeVars = bindTypeVarsWith RequestMatch
+
+
+-- |Canonicalise a list of types, with type variables starting from the
+-- supplied Int. The returned dictionary is in the canonical namespace and
+-- contains the effective trait bounds of every generated type variable.
+canonicalise :: Int -> TypeVarDict -> [TypeSpec]
+             -> (([TypeSpec], TypeVarDict), Int)
+canonicalise ctr tvarDict tys =
+    let (tys', ctr', (_, canonicalDict)) =
+            canonicaliseList tvarDict (Map.empty, Map.empty) ctr tys
+    in ((tys', canonicalDict), ctr')
+
+
+type Canonicalisation = (Map TypeVarName TypeSpec, TypeVarDict)
+
+
+canonicaliseList :: TypeVarDict -> Canonicalisation -> Int -> [TypeSpec]
+                 -> ([TypeSpec], Int, Canonicalisation)
+canonicaliseList _ state ctr [] = ([], ctr, state)
+canonicaliseList tvarDict state ctr (ty:tys) =
+    let (ty', ctr', state') = canonicaliseSingle tvarDict state ctr ty
+        (tys', ctr'', state'') = canonicaliseList tvarDict state' ctr' tys
+    in (ty':tys', ctr'', state'')
+
+
+canonicaliseSingle :: TypeVarDict -> Canonicalisation -> Int -> TypeSpec
+                   -> (TypeSpec, Int, Canonicalisation)
+canonicaliseSingle tvarDict state@(tyMap, canonicalDict) ctr
+        ty@TypeVariable{typeVariableName=name} =
+    case Map.lookup name tyMap of
+        Just ty' -> (ty', ctr, state)
+        Nothing ->
+            let canonicalName = FauxTypeVar ctr
+                ty' = TypeVariable canonicalName Set.empty
+                stateWithVar = (Map.insert name ty' tyMap, canonicalDict)
+                bounds = Set.toAscList $ typeVarBoundsIn tvarDict ty
+                (bounds', ctr', (tyMap', canonicalDict')) =
+                    canonicaliseList tvarDict stateWithVar (ctr + 1) bounds
+                canonicalDict'' = if List.null bounds'
+                    then canonicalDict'
+                    else Map.insert canonicalName (Right $ Set.fromList bounds')
+                            canonicalDict'
+            in (ty', ctr', (tyMap', canonicalDict''))
+canonicaliseSingle tvarDict state ctr ty@TypeSpec{typeParams=tys} =
+    let (tys', ctr', state') = canonicaliseList tvarDict state ctr tys
+    in (ty{typeParams=tys'}, ctr', state')
+canonicaliseSingle tvarDict state ctr
+        ty@HigherOrderType{higherTypeParams=tfs} =
+    let tys = typeFlowType <$> tfs
+        (tys', ctr', state') = canonicaliseList tvarDict state ctr tys
+    in (ty{higherTypeParams=zipWith TypeFlow tys' $ typeFlowMode <$> tfs},
+        ctr', state')
+canonicaliseSingle _ state ctr ty = (ty, ctr, state)
+
+
+-- |Return the bounds stated directly on a type-variable occurrence together
+-- with bounds recorded directly for that variable.
+typeVarBoundsIn :: TypeVarDict -> TypeSpec -> Set TraitSpec
+typeVarBoundsIn dict TypeVariable{typeVariableName=name,
+                                  typeVariableBounds=bounds} =
+    bounds `Set.union` case Map.lookup name dict of
+        Just (Right bounds') -> bounds'
+        _ -> Set.empty
+typeVarBoundsIn _ _ = Set.empty
+
+
+-- |Whether two trait constraints differ only in their type-variable names.
+-- Bounds on the variables themselves do not participate in the comparison.
+sameTraitConstraint :: TypeSpec -> TypeSpec -> Bool
+sameTraitConstraint left right = canonicalType left == canonicalType right
+  where
+    canonicalType = fst . fst . canonicalise 0 Map.empty . pure . clearBounds
+    clearBounds ty@TypeVariable{} = ty { typeVariableBounds=Set.empty }
+    clearBounds ty@TypeSpec{typeParams=params} =
+        ty { typeParams=clearBounds <$> params }
+    clearBounds ty@HigherOrderType{higherTypeParams=flows} =
+        ty { higherTypeParams=clearFlow <$> flows }
+    clearBounds ty = ty
+    clearFlow flow = flow { typeFlowType=clearBounds $ typeFlowType flow }
+
+
+-- |Instantiate a generic implementation declaration for a requested
+-- implementation type.
+specialiseTraitImpl :: TraitImplSpec -> TypeSpec -> Maybe TraitImplSpec
+specialiseTraitImpl declared requestedType = do
+    bindings <- bindTypeVars Map.empty (implType declared) requestedType
+    return $ TraitImplSpec
+        (substituteTypeVars bindings $ implTrait declared)
+        (substituteTypeVars bindings $ implType declared)
+
+
+substituteTypeVars :: Map TypeVarName TypeSpec -> TypeSpec -> TypeSpec
+substituteTypeVars bindings ty@TypeVariable{typeVariableName=name} =
+    Map.findWithDefault ty name bindings
+substituteTypeVars bindings ty@TypeSpec{typeParams=params} =
+    ty { typeParams = substituteTypeVars bindings <$> params }
+substituteTypeVars bindings ty@HigherOrderType{higherTypeParams=flows} =
+    ty { higherTypeParams = substituteFlow <$> flows }
+  where
+    substituteFlow flow =
+        flow { typeFlowType = substituteTypeVars bindings $ typeFlowType flow }
+substituteTypeVars _ ty = ty
+
+
+-- |The trait bounds declared within an implementation type, in ABI order:
+-- type variables by first occurrence, then each variable's bounds in ascending
+-- order. Repeated occurrences of a variable contribute their union of bounds.
+traitImplTypeBounds :: TraitImplSpec -> [TypeVarBound]
+traitImplTypeBounds = typeBounds . implType
+  where
+    typeBounds ty =
+        [ (name, bound)
+        | name <- List.nub $ typeVarNames ty
+        , bound <- Set.toAscList $ Map.findWithDefault Set.empty name (boundsIn ty)
+        ]
+    typeVarNames TypeVariable{typeVariableName=name} = [name]
+    typeVarNames TypeSpec{typeParams=params} = concatMap typeVarNames params
+    typeVarNames HigherOrderType{higherTypeParams=flows} =
+        concatMap (typeVarNames . typeFlowType) flows
+    typeVarNames _ = []
+    boundsIn TypeVariable{typeVariableName=name,typeVariableBounds=bounds} =
+        Map.singleton name bounds
+    boundsIn TypeSpec{typeParams=params} =
+        List.foldl' (Map.unionWith Set.union) Map.empty $ boundsIn <$> params
+    boundsIn HigherOrderType{higherTypeParams=flows} =
+        List.foldl' (Map.unionWith Set.union) Map.empty $
+            boundsIn . typeFlowType <$> flows
+    boundsIn _ = Map.empty
+
+
+-- |The concrete trait implementations that provide the constraints needed
+-- to instantiate a partial implementation. An empty list means either the
+-- declaration does not match the request or the implementation is not partial.
+traitImplConstraints :: TraitImplSpec -> TraitImplSpec -> [TraitImplSpec]
+traitImplConstraints declared =
+    traitImplConstraintsFor (traitImplTypeBounds declared) declared
+
+
+-- |Specialise an explicitly supplied, canonically ordered constraint
+-- layout for a requested implementation. Compiled code should obtain this
+-- list from VTableInfo rather than reconstructing it from the implementation.
+traitImplConstraintsFor :: [TypeVarBound] -> TraitImplSpec -> TraitImplSpec
+                          -> [TraitImplSpec]
+traitImplConstraintsFor constraints declared requested =
+  case traitImplBindings declared requested of
+    Nothing -> []
+    Just bindings ->
+        [ TraitImplSpec (substituteTypeVars bindings bound) concrete
+        | (name, bound) <- constraints
+        , let concrete = Map.findWithDefault
+                (TypeVariable name Set.empty) name bindings
+        ]
+
+
+-- |A type variable together with the trait it is required to implement.
+type TypeVarBound = (TypeVarName, TraitSpec)
+
 -- | The contents of a constant memory block.
 data StructInfo
     -- | A constant memory structure with possibly non-uniform field sizes
@@ -3543,6 +4306,16 @@ data StructInfo
         structSize :: Int,          -- ^ The size of the struct in bytes
         structData :: [ConstValue]  -- ^ Contents of the struct, in memory order
         }
+    | VTableInfo {
+        vtableSize :: Int,          -- ^ The size of the struct in bytes
+        vtableData :: [ConstValue], -- ^ Contents of the struct, in memory order
+        vtableExternal :: Bool,     -- ^ Whether this vtable is defined in other module
+        vtableIndex :: Int,         -- ^ Its index in the defining module
+        vtableSpec :: TraitImplSpec,-- ^ The trait impl spec
+        vtableMod  :: ModSpec,      -- ^ The mod where this vtable is defined
+        vtableConstraints :: [TypeVarBound]
+                                    -- ^ Constraint slots after method slots
+    }
     -- | A constant memory block of characters, with 0-termination.  A more
     -- concise representation for this special case.
     | CStringInfo {
@@ -3629,9 +4402,15 @@ constValueAtOffset (StructInfo _ fields) offset = go fields offset
             | off < 0 = Nothing
             | otherwise = go fields (off - constValueSize field)
           go [] _ = Nothing
+constValueAtOffset (VTableInfo _ fields _ _ _ _ _) offset = go fields offset
+    where go (field:fields) off
+            | off == 0 = Just field
+            | off < 0 = Nothing
+            | otherwise = go fields (off - constValueSize field)
+          go [] _ = Nothing
 constValueAtOffset (CStringInfo chars) offset =
     (`IntStructMember` 1) . toInteger . ord <$> (chars !? offset)
-constValueAtOffset (ArrayInfo []) _ = Nothing 
+constValueAtOffset (ArrayInfo []) _ = Nothing
 constValueAtOffset (ArrayInfo elts@(elt:_)) offset =
     let eltSize = constValueSize elt
         (idx, eltOffset) = divMod offset eltSize
@@ -3666,6 +4445,8 @@ primArgs (PrimCall _ _ _ args gFlows) = (args, gFlows)
 primArgs (PrimHigher _ fn _ args)
     = (fn:args, if isResourcefulHigherOrder $ argType fn
                 then univGlobalFlows else emptyGlobalFlows)
+primArgs (PrimVirtualCall _ table _ _ args gFlows)
+    = (table:args, gFlows)
 primArgs (PrimForeign "lpvm" "load" _ args@[ArgGlobal info _, _])
     = (args, addGlobalFlow info FlowIn emptyGlobalFlows)
 primArgs (PrimForeign "lpvm" "store" _ args@[_, ArgGlobal info _])
@@ -3681,6 +4462,10 @@ replacePrimArgs (PrimHigher id _ _ _) [] _
     = shouldnt "replacePrimArgs of higher call with not enough args"
 replacePrimArgs (PrimHigher id _ impurity _) (fn:args) _
     = PrimHigher id fn impurity args
+replacePrimArgs (PrimVirtualCall id _ _ _ _ _) [] _
+    = shouldnt "replacePrimArgs of virtual call with not enough args"
+replacePrimArgs (PrimVirtualCall id _ index impurity _ _) (table:args) gFlows
+    = PrimVirtualCall id table index impurity args gFlows
 replacePrimArgs (PrimForeign lang nm flags _) args _
     = PrimForeign lang nm flags args
 
@@ -3714,6 +4499,7 @@ argGlobalFlow varFlows (ArgClosure pspec args _) = do
 argGlobalFlow varFlows (ArgConstRef structID _) = do
     lookupConstInfo structID >>= (\case
             StructInfo _ fields -> constsGlobalFlows fields
+            VTableInfo _ fields _ _ _ _ _ -> constsGlobalFlows fields
             _ -> return emptyGlobalFlows)
         . trustFromJust "lookupConstStruct"
 argGlobalFlow _ _ = return emptyGlobalFlows
@@ -3749,6 +4535,7 @@ constGlobalFlows :: ConstValue -> Compiler GlobalFlows
 constGlobalFlows (PointerStructMember structID) = do
     lookupConstInfo structID >>= (\case
             StructInfo _ fields -> constsGlobalFlows fields
+            VTableInfo _ fields _ _ _ _ _ -> constsGlobalFlows fields
             _ -> return emptyGlobalFlows)
         . trustFromJust "lookupConstStruct"
 constGlobalFlows _ = return emptyGlobalFlows
@@ -3812,12 +4599,14 @@ data ArgFlowType = Ordinary        -- ^An argument/parameter as written by user
                                    -- ^An argument to pass a resource
                  | Free            -- ^An argument to be passed in the closure
                                    -- environment
+                 | VTable          -- ^An argument to pass a vtable
      deriving (Eq,Ord,Generic)
 
 instance Show ArgFlowType where
     show Ordinary = ""
     show (Resource _) = "%"
     show Free = "^"
+    show VTable = ""
 
 
 -- |The dataflow direction of an actual argument.
@@ -3879,7 +4668,8 @@ argDescription (ArgVar var _ flow ftype _) =
     ++ (case ftype of
           Ordinary       -> " variable " ++ primVarName var
           Resource rspec -> " resource " ++ show rspec
-          Free           -> " closure argument ")
+          Free           -> " closure argument "
+          VTable         -> " vtable ")
 argDescription (ArgInt val _) = "constant argument '" ++ show val ++ "'"
 argDescription (ArgFloat val _) = "constant argument '" ++ show val ++ "'"
 argDescription (ArgClosure ms as _)
@@ -4022,7 +4812,7 @@ setExpTypeFlow typeflow (Typed expr _ castInner)
     where Typed expr' ty' _ = setExpTypeFlow typeflow expr
 setExpTypeFlow (TypeFlow ty fl) (Var name _ ftype)
     = Typed (Var name fl ftype) ty Nothing
-setExpTypeFlow (TypeFlow ty ParamIn) expr
+setExpTypeFlow (TypeFlow ty flow) expr | flow /= ParamOut
     = Typed expr ty Nothing
 setExpTypeFlow (TypeFlow ty fl) expr
     = shouldnt $ "Cannot set type/flow of " ++ show expr
@@ -4157,6 +4947,10 @@ instance Show Item where
     "representation"
     ++ bracketList "(" ", " ")" (("?"++) <$> params)
     ++ " is " ++ show typeModifiers ++ show repn ++ showOptPos pos ++ "\n"
+  show (TraitDecl params typeModifiers pos) =
+    "trait"
+    ++ bracketList "(" ", " ")" (("?"++) <$> params)
+    ++ show typeModifiers ++ showOptPos pos ++ "\n"
   show (ConstructorDecl vis params typeModifiers ctors pos) =
     visibilityPrefix vis ++ "constructors"
     ++ bracketList "(" ", " ")" (("?"++) <$> params) ++ " "
@@ -4181,9 +4975,13 @@ instance Show Item where
     ++ showOptPos pos ++ "\n  "
     ++ intercalate "\n  " (List.map show items)
     ++ "\n}\n"
-  show (ResourceDecl vis name typ init pos) =
-    visibilityPrefix vis ++ "resource " ++ name ++ ":" ++ show typ
-    ++ maybeShow " = " init " "
+  show (ResourceDecl vis name resdef pos) =
+    visibilityPrefix vis ++ "resource " ++ name ++
+        case resdef of
+          SimpleResourceDefn typ init ->
+            ":" ++ show typ ++ maybeShow " = " init " "
+          CompoundResourceDefn rspecs ->
+            " = " ++ intercalate ", " (List.map show rspecs)
     ++ showOptPos pos
   show (FuncDecl vis modifiers proto typ exp pos) =
     visibilityPrefix vis
@@ -4200,7 +4998,7 @@ instance Show Item where
     ++ showOptPos pos
     ++ " {"
     ++ showBody 4 stmts
-    ++ "\n  }"  
+    ++ "\n  }"
   show (ForeignProcDecl vis lang modifiers mbAlias proto retType pos) =
     visibilityPrefix vis
     ++ "def foreign "
@@ -4210,8 +5008,21 @@ instance Show Item where
     ++ show proto
     ++ showTypeSuffix retType Nothing
     ++ showOptPos pos
+  show (AbstractProcDecl modifiers proto retType pos) =
+    "abstract "
+    ++ showProcModifiers' modifiers
+    ++ show proto
+    ++ showTypeSuffix retType Nothing
+    ++ showOptPos pos
   show (StmtDecl stmt pos) =
     showStmt 4 stmt ++ showOptPos pos
+  show (TraitImpl typ traits pos) =
+    "impl "
+    ++ maybeShow "" typ " <: "
+    ++ case traits of
+        [trait] -> show trait
+        _ -> bracketList "{" "}" ", " (List.map show traits)
+    ++ showOptPos pos
   show (PragmaDecl prag) =
     "pragma " ++ show prag
 
@@ -4232,6 +5043,11 @@ instance Show TypeRepresentation where
 instance Show TypeFamily where
   show IntFamily   = "integer/address type"
   show FloatFamily = "floating point type"
+
+
+instance Show TraitImplSpec where
+  show (TraitImplSpec implTrait implType) =
+    show implType ++ " <: " ++ show implTrait
 
 
 -- |How to show a ModSpec.
@@ -4322,9 +5138,9 @@ instance Show TypeDef where
     ++ showOptPos pos
 
 
--- |How to show a resource definition.
-instance Show ResourceImpln where
-  show (SimpleResource typ init pos) =
+-- |How to show a primitive resource definition.
+instance Show PrimResourceImpln where
+  show (PrimResource typ init pos) =
     show typ ++ maybeShow " = " init "" ++ showOptPos pos
 
 
@@ -4338,11 +5154,12 @@ showProcDefs firstID (def:defs) =
 -- |How to show a proc definition.
 showProcDef :: Int -> ProcDef -> String
 showProcDef thisID
-  procdef@(ProcDef n proto def pos tmpCount _ _ vis detism inline impurity ctor
-                   sub _) =
+  procdef@(ProcDef n proto def pos tmpCount _ _ vis abstract detism inline impurity ctor
+                   sub _ _ _) =
     "\n"
     ++ showProcName n ++ " > "
     ++ visibilityPrefix vis
+    ++ (if isJust abstract then "abstract " else "")
     ++ showProcModifiers' (ProcModifiers detism inline impurity ctor False)
     ++ "(" ++ show (procCallCount procdef) ++ " calls)"
     ++ showSuperProc sub
@@ -4365,17 +5182,29 @@ showProcName :: ProcName -> String
 showProcName = showProcIdentifier "proc"
 
 
+-- | A printable version of a proc name; handles special empty proc name.
+showProcOrVarName :: ProcName -> String
+showProcOrVarName name = "`" ++ name ++ "`"
+
 -- |How to show a type specification.
 instance Show TypeSpec where
   show AnyType              = "any"
   show InvalidType          = "XXX"
-  show (TypeVariable name)  = show name
+  show (TypeVariable name bounds) =
+      show name ++ showTypeVariableBounds bounds
   show (Representation rep) = show rep
   show (TypeSpec optmod ident args) =
       maybeModPrefix optmod ++ ident ++ showArguments args
   show (HigherOrderType mods params) =
       showProcModifiers mods
       ++ "(" ++ intercalate ", " (show <$> params) ++ ")"
+
+
+showTypeVariableBounds :: Set TraitSpec -> String
+showTypeVariableBounds bounds
+  | Set.null bounds = ""
+  | [bound] <- Set.toAscList bounds = "<:" ++ show bound
+  | otherwise = "<:{" ++ intercalate ", " (show <$> Set.toAscList bounds) ++ "}"
 
 
 -- |Show the use declaration for a set of resources, if it's non-empty.
@@ -4451,9 +5280,9 @@ showFork ind (PrimFork var ty last bodies deflt) =
 showFork ind (MergedFork var ty last table body deflt) =
     startLine ind ++ "factored " ++ (if last then "~" else "") ++ show var ++
                   ":" ++ show ty ++ " of" ++
-    List.concatMap (\(var, ty, struct, vals) -> 
+    List.concatMap (\(var, ty, struct, vals) ->
                         startLine (ind + 2) ++ "?" ++ show var ++ ":" ++ show ty ++
-                        " <- " ++ show struct ++ "" ++ show vals ++ "") 
+                        " <- " ++ show struct ++ "" ++ show vals ++ "")
         table
     ++ showBlock (ind+4) body
     ++ maybe "" (\b -> startLine ind ++ "else:"
@@ -4485,6 +5314,11 @@ showPrim (PrimCall id pspec _ args globalFlows) =
         ++ " #" ++ show id
 showPrim (PrimHigher id var _ args) =
     show var ++ showArguments args ++ " #" ++ show id
+showPrim (PrimVirtualCall id table index _ args gFlows) =
+    show table ++ "@" ++ show index
+        ++ showArguments args
+        ++ (if gFlows == emptyGlobalFlows then "" else show gFlows)
+        ++ " #" ++ show id
 showPrim (PrimForeign lang name flags args) =
     "foreign " ++ lang ++ " " ++ showFlags' flags
     ++ name ++ showArguments args
@@ -4633,6 +5467,7 @@ instance Show StringVariant where
 instance Show GlobalInfo where
     show (GlobalResource res) = "<<" ++ show res ++ ">>"
     show (GlobalVariable res) = "@" ++ res
+    show (GlobalVTable res) = "vtable " ++ show res
 
 
 showMap :: String -> String -> String -> (k->String) -> (v->String)
@@ -4682,39 +5517,39 @@ maybeShowStr pre (Just something) post =
 ------------------------------ Error Reporting -----------------------
 
 -- |Report an internal error and abort.
-shouldnt :: String -> a
+shouldnt :: HasCallStack => String -> a
 shouldnt what = error $ "Internal error: " ++ what
 
 
 -- |Report an internal error and abort unless the test succeeds.
-should :: String -> Bool -> ()
+should :: HasCallStack => String -> Bool -> ()
 should _    True  = ()
 should what False = shouldnt what
 
 
 -- |Report that some feature is not yet implemented and abort.
-nyi :: String -> a
+nyi :: HasCallStack => String -> a
 nyi what = error $ "Not yet implemented: " ++ what
 
 
 -- |Check that all is well, else abort.
-checkError :: Monad m => String -> Bool -> m ()
+checkError :: HasCallStack => Monad m => String -> Bool -> m ()
 checkError msg bad = when bad $ shouldnt msg
 
 
 -- |Check that a value is OK; if so, return it, else abort.
-checkValue :: (t -> Bool) -> String -> t -> t
+checkValue :: HasCallStack => (t -> Bool) -> String -> t -> t
 checkValue tst msg val = if tst val then val else shouldnt msg
 
 
 -- |Like fromJust, but with its own error message.
-trustFromJust :: String -> Maybe t -> t
+trustFromJust :: HasCallStack => String -> Maybe t -> t
 trustFromJust msg Nothing = shouldnt $ "trustFromJust in " ++ msg
 trustFromJust _ (Just val) = val
 
 
 -- |Monadic version of trustFromJust.
-trustFromJustM :: Monad m => String -> m (Maybe t) -> m t
+trustFromJustM :: HasCallStack => Monad m => String -> m (Maybe t) -> m t
 trustFromJustM msg computation = do
     trustFromJust msg <$> computation
 
@@ -4748,6 +5583,12 @@ queueMessage msg = do
 --  specified source location to the collected compiler output messages.
 errmsg :: OptPos -> String -> Compiler ()
 errmsg = flip (message Error)
+
+
+-- |Add the specified string as a warning message referring to the optionally
+--  specified source location to the collected compiler output messages.
+warnmsg :: OptPos -> String -> Compiler ()
+warnmsg = flip (message Warning)
 
 
 -- |Pretty helper operator for adding messages to the compiler state.
