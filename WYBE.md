@@ -1945,6 +1945,66 @@ The third declaration is selected when both type arguments implement
 `named`; without it, selecting a `formattable` implementation for such a pair
 would be ambiguous.
 
+### Trait prerequisites
+
+A trait may require its implementing types to implement other traits.  Declare
+these *prerequisites* with `<:` after `trait`, using braces for multiple traits.
+In a top-level trait module, write `trait <: named` for a single prerequisite.
+For example, a top-level version of the earlier `listable` trait can require
+the existing `named` and `priced` traits:
+
+```
+# listable.wybe
+use named
+use priced
+
+trait <: {named, priced}
+
+abstract listing(x:_): string
+```
+
+For a submodule trait, place the prerequisites after `trait` in the `type`
+declaration.  The earlier `listable` declaration can be replaced with:
+
+```
+type listable trait <: {named, priced} {
+    abstract listing(x:_): string
+}
+```
+
+For a single prerequisite, write `type listable trait <: named { ... }`.
+
+A procedure constrained by `listable` can also use its prerequisites without
+listing them separately in the type bound:
+
+```
+def shop_label(x:listable): string =
+    "$(named.name(x)): $(priced.price(x)) - $(listable.listing(x))"
+```
+
+An `impl` declaration for `listable` requires a unique applicable implementation
+of each prerequisite for the same type.  It does not declare those
+implementations automatically.  Reusing the earlier traits, a new `book` type
+can implement all three:
+
+```
+type book {
+    pub book(title:string, cost:int)
+}
+
+impl book <: {named, priced, listable}
+
+def name(x:book): string = x^title
+def price(x:book): int = x^cost
+
+def listing(x:book): string = "paperback"
+```
+
+Now `shop_label(book("Dune", 12))` returns `"Dune: 12 - paperback"`.  Prerequisites are
+transitive: if a prerequisite itself requires another trait, that trait is also
+available through the original bound and must have an applicable implementation.
+Missing or ambiguous prerequisite implementations are compile-time errors.
+
 ### Default trait implementations
 
 A trait may give an abstract procedure or function a default implementation by
@@ -2023,14 +2083,18 @@ It may optionally specify an initial value:
 
 > `resource` *name*`:`*type* `=` *expr*
 
-In this case, the resource is
-defined in any top level code in that module, as well as any top level code in
-any module that `use`s this module, but not in any module that this module
-`use`s.  The latter restriction is necessary because when two modules depend on
-one another, the order in which their resources are initialised is unspecified.
+The expression *expr* is evaluated after any top level code appearing before it,
+so it may refer to variables and resources assigned in top level code earlier in
+the module.  Likewise, top level code appearing after the resource declaration
+may use and reassign this resource.
 
 A resource may be exported, allowing it to be referred to in other modules, by
 preceding the `resource` declaration with the `pub` keyword.
+This also permits it to be used and reassigned in any top level code in
+any modules that `use` this module, but *not* in any module that this module
+`use`s.  The latter restriction is necessary because when two modules depend on
+one another, the order in which their resources are initialised is unspecified.
+
 
 ### <a name="compound-resource-declarations"></a>Declaring a compound resource
 
